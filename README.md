@@ -41,12 +41,12 @@ The server script receives DNS queries, extracts and decodes the data, and recon
 
 ### Running the Client
 ```bash
-python client.py --file <path_to_file> --domain <domain_name> --server_ip <server_ip> --server_port <server_port>
+python client.py --file-path <path_to_file> --domain <domain_name> --server-ip <server_ip> --server-port <server_port>
 ```
 
 ### Running the Server
 ```bash
-python server.py --port <listening_port> --output-dir <output_directory>
+python server.py --port <listening_port> --output-dir <output_directory> --low <minimum latency per chunk> --high <maximum latency per chunk> --domain <domain needs to match client>
 ```
 
 ## License
