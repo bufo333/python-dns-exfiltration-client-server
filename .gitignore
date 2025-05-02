@@ -2,3 +2,4 @@
 *.exe
 *.venv
 *.env
+**/.idea
