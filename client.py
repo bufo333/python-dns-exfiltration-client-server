@@ -23,6 +23,7 @@ from math import ceil
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv())
+
 # Configure logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
