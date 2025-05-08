@@ -27,11 +27,11 @@ import threading
 import time
 from collections import defaultdict
 
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from dnslib import DNSRecord, RR, QTYPE, A
+from dnslib import DNSRecord, RR, QTYPE, A, TXT
 from dotenv import load_dotenv, find_dotenv
 
 # Configure environment and logging
@@ -195,7 +195,18 @@ def handle_request(data, addr, sock, args):
     Main DNS packet handler: routes key exchange or data chunk logic.
     """
     qname = parse_qname(data).rstrip('.')
+    qtype = DNSRecord.parse(data).q.qtype
     if not qname.endswith(args.domain):
+        return
+
+        #  ——— Serve TXT for public key ———
+    expected_name = f"public.{args.domain}".lower()
+    if qtype == QTYPE.TXT and qname.lower() == expected_name:
+        # craft a TXT reply containing the Base32 server public key
+        req = DNSRecord.parse(data)
+        reply = req.reply()
+        reply.add_answer(RR(req.q.qname, QTYPE.TXT, rdata=TXT(handle_request.server_pub_b32), ttl=300))
+        sock.sendto(reply.pack(), addr)
         return
 
     prefix = qname[:-(len(args.domain) + 1)]
@@ -247,6 +258,11 @@ def start_server(args):
         priv = x25519.X25519PrivateKey.from_private_bytes(f.read())
     handle_request.server_priv = priv
 
+    with open(args.server_pubkey, 'rb') as f:
+        pub = x25519.X25519PublicKey.from_public_bytes(f.read())
+    handle_request.server_pub_b32 = base64.b32encode(
+        pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw))
+
     thread = threading.Thread(target=cleanup_stale, daemon=True)
     thread.start()
 
@@ -274,5 +290,6 @@ if __name__ == '__main__':
     parser.add_argument('--output-dir', default='output')
     parser.add_argument('--domain', default='xf.example.com')
     parser.add_argument('--server-key', default=os.getenv('SERVER_PRIVATE_KEY'), help='Path to X25519 private key file')
+    parser.add_argument('--server-pubkey', default=os.getenv('SERVER_PUBLIC_KEY'), help='Path to server public key')
     args = parser.parse_args()
     start_server(args)
