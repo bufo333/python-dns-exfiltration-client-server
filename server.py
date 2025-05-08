@@ -22,7 +22,6 @@ import hashlib
 import hmac
 import logging
 import os
-import random
 import socket
 import threading
 import time
@@ -205,7 +204,6 @@ def handle_request(data, addr, sock, args):
         return
 
     identifier, index, total, payload = parts
-    time.sleep(random.uniform(args.low, args.high) / 1000.0)
 
     if index == '0' and total == '0':
         # key exchange
@@ -274,8 +272,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="DNS Exfiltration Server (ECDH + AES-GCM + HMAC)")
     parser.add_argument('--port', type=int, default=5300)
     parser.add_argument('--output-dir', default='output')
-    parser.add_argument('--low', type=int, default=100)
-    parser.add_argument('--high', type=int, default=1500)
     parser.add_argument('--domain', default='xf.example.com')
     parser.add_argument('--server-key', default=os.getenv('SERVER_PRIVATE_KEY'), help='Path to X25519 private key file')
     args = parser.parse_args()
