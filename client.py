@@ -193,9 +193,6 @@ def fetch_server_pubkey(domain):
     q = DNSRecord.question(f"public.{domain}", 'TXT')
     a = q.send(dest=args.server_ip, port=args.server_port, timeout=2)
     txt = str(DNSRecord.parse(a).get_a().rdata).strip('"')
-    print(txt)
-    print(len(txt))
-    print('hello')
     pad_len = (8 - len(txt) % 8) % 8
     txt = str(txt) + "=" * pad_len  # add padding
     print(txt)
