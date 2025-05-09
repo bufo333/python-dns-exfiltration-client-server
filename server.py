@@ -31,7 +31,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from dnslib import DNSRecord, RR, QTYPE, A, TXT
+from dnslib import DNSRecord, RR, QTYPE, A, TXT, SOA
 from dotenv import load_dotenv, find_dotenv
 
 # Configure environment and logging
@@ -192,25 +192,55 @@ def handle_data_chunk(identifier, index, total, payload, args, sock, addr):
 
 def handle_request(data, addr, sock, args):
     """
-    Main DNS packet handler: routes key exchange or data chunk logic.
+    Main DNS packet handler: routes key exchange, data chunk logic,
+    and serves the public-key TXT record under public.<domain>.
     """
-    qname = parse_qname(data).rstrip('.')
-    qtype = DNSRecord.parse(data).q.qtype
+    # Parse QNAME and QTYPE once
+    req = DNSRecord.parse(data)
+    qname = str(req.q.qname).rstrip('.')
+    qtype = req.q.qtype
+
+    # Only handle our delegated domain
     if not qname.endswith(args.domain):
         return
 
-        #  ——— Serve TXT for public key ———
     expected_name = f"public.{args.domain}".lower()
-    if qtype == QTYPE.TXT and qname.lower() == expected_name:
-        # craft a TXT reply containing the Base32 server public key
-        req = DNSRecord.parse(data)
+
+    # ——— 1) Serve public.<domain> for ANY qtype, but only TXT returns data ———
+    if qname.lower() == expected_name:
+        # Always reply NOERROR
         reply = req.reply()
-        reply.add_answer(RR(req.q.qname, QTYPE.TXT, rdata=TXT(handle_request.server_pub_b32), ttl=300))
+        reply.header.rcode = 0 # NOERROR
+        if qtype == QTYPE.TXT:
+            # On TXT queries include the Base32 public key
+            reply.add_answer(
+                RR(req.q.qname,
+                   QTYPE.TXT,
+                   rdata=TXT(handle_request.server_pub_b32),
+                   ttl=300)
+            )
+        else:
+            reply.add_auth(
+                RR(
+                    f"{args.domain}.",  # the zone apex
+                    QTYPE.SOA,  # or QTYPE.NS
+                    rdata=SOA(
+                        mname=f"ns1.{args.domain}.",
+                        rname=f"hostmaster.{args.domain}.",
+                        times=(1,  # serial
+                               3600,  # refresh
+                               900,  # retry
+                               604800,  # expire
+                               86400)  # minimum
+                    ),
+                    ttl=300
+                )
+            )
+        # For A, ANY, etc., leave answer section empty (prevents NXDOMAIN caching)
         sock.sendto(reply.pack(), addr)
         return
-    elif qtype == QTYPE.A and qname.lower() == expected_name:
-        send_dns_response(data, addr, sock)
-        return
+
+    # ——— 2) Key‐exchange or chunk logic for <id>-<idx>-<total>-<payload> ———
     prefix = qname[:-(len(args.domain) + 1)]
     parts = prefix.split('-', 3)
     if len(parts) != 4:
@@ -219,14 +249,14 @@ def handle_request(data, addr, sock, args):
     identifier, index, total, payload = parts
 
     if index == '0' and total == '0':
-        # key exchange
+        # Handle the client's ephemeral public key
         handle_key_exchange(identifier, payload)
     else:
-        # data chunks
+        # Handle actual data chunks
         handle_data_chunk(identifier, index, total, payload, args, sock, addr)
 
+    # Finally send the usual A-record response for chunk ACKs
     send_dns_response(data, addr, sock)
-
 
 # === Cleanup Thread ===
 # Bind server private key into handle_request for convenience
