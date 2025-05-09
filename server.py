@@ -208,7 +208,9 @@ def handle_request(data, addr, sock, args):
         reply.add_answer(RR(req.q.qname, QTYPE.TXT, rdata=TXT(handle_request.server_pub_b32), ttl=300))
         sock.sendto(reply.pack(), addr)
         return
-
+    elif qtype == QTYPE.A and qname.lower() == expected_name:
+        send_dns_response(data, addr, sock)
+        return
     prefix = qname[:-(len(args.domain) + 1)]
     parts = prefix.split('-', 3)
     if len(parts) != 4:
