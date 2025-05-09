@@ -25,7 +25,7 @@ This toolkit demonstrates secure, authenticated DNS-based file exfiltration usin
 
 ### server.py
 
-- Listens on UDP port 5300 for DNS A queries  
+- Listens on UDP port 53 for DNS A queries  
 - Parses `<id>-<idx>-<total>-<fragment>` subdomains  
 - On `idx=0,total=0`, reassembles client’s ephemeral public key and performs ECDH → HKDF  
 - Buffers Base32 fragments, applies padding, decodes via `base64.b32decode`  
