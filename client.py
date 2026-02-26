@@ -33,6 +33,7 @@ from uuid import uuid4
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from dnslib import DNSRecord, DNSQuestion, QTYPE
@@ -43,6 +44,29 @@ logger = logging.getLogger('client')
 
 # Constants
 MAX_RETRIES = 3
+
+
+def load_signing_key(path):
+    """Load an Ed25519 private key from a raw 32-byte seed file."""
+    with open(path, 'rb') as f:
+        seed = f.read()
+    return Ed25519PrivateKey.from_private_bytes(seed)
+
+
+def load_identity_pubkey(path):
+    """Load an Ed25519 public key from a raw 32-byte file."""
+    with open(path, 'rb') as f:
+        pub_bytes = f.read()
+    return Ed25519PublicKey.from_public_bytes(pub_bytes)
+
+
+def compute_fingerprint(pub_key):
+    """Compute 8-byte fingerprint = SHA256(raw_pubkey)[:8]."""
+    pub_bytes = pub_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+    return hashlib.sha256(pub_bytes).digest()[:8]
 
 
 def derive_shared_keys(client_priv, server_pub_bytes):
@@ -151,10 +175,16 @@ def reliable_send(subdomain, args):
     return False
 
 
-def perform_key_exchange(identifier, args):
+def perform_key_exchange(identifier, args, signing_key=None, server_identity_pubkey=None):
     """
     Generate ephemeral client keypair, send pubkey as TXT query,
     receive server's ephemeral pubkey from TXT response, derive shared keys.
+
+    If signing_key is provided, the client signs its ephemeral pubkey and
+    appends the signature + fingerprint to the key exchange payload.
+    If server_identity_pubkey is provided, the client verifies the server's
+    Ed25519 signature on its ephemeral pubkey.
+
     Returns (aes_key, hmac_key).
     """
     client_priv = x25519.X25519PrivateKey.generate()
@@ -162,9 +192,19 @@ def perform_key_exchange(identifier, args):
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw
     )
-    b32_pub = base32_encode(pub_bytes)
 
-    # Split pubkey across DNS labels to stay within 63-char label limit.
+    # Build key exchange payload: pubkey alone (32B) or pubkey + sig + fingerprint (104B)
+    if signing_key:
+        signature = signing_key.sign(pub_bytes)
+        fingerprint = compute_fingerprint(signing_key.public_key())
+        kex_payload = pub_bytes + signature + fingerprint  # 32 + 64 + 8 = 104 bytes
+        logger.info(f"[{identifier}] Signing ephemeral key for authentication")
+    else:
+        kex_payload = pub_bytes
+
+    b32_pub = base32_encode(kex_payload)
+
+    # Split payload across DNS labels to stay within 63-char label limit.
     # First label: <id>-0-0-<part1>, remaining parts as additional labels.
     header = f"{identifier}-0-0-"
     max_first = 63 - len(header)
@@ -191,7 +231,28 @@ def perform_key_exchange(identifier, args):
                     txt = str(rr.rdata).strip('"')
                     pad_len = (8 - len(txt) % 8) % 8
                     txt_padded = txt + '=' * pad_len
-                    server_pub_bytes = base64.b32decode(txt_padded)
+                    response_bytes = base64.b32decode(txt_padded)
+
+                    if len(response_bytes) == 96 and server_identity_pubkey:
+                        # Authenticated response: 32B pubkey + 64B signature
+                        server_pub_bytes = response_bytes[:32]
+                        server_sig = response_bytes[32:]
+                        try:
+                            server_identity_pubkey.verify(server_sig, server_pub_bytes)
+                            logger.info(f"[{identifier}] Server identity VERIFIED — TRUSTED")
+                        except Exception:
+                            logger.warning(f"[{identifier}] Server signature verification FAILED — UNAUTHENTICATED")
+                    elif len(response_bytes) == 96 and not server_identity_pubkey:
+                        server_pub_bytes = response_bytes[:32]
+                        logger.warning(f"[{identifier}] Server sent signed response but no identity pubkey configured — UNAUTHENTICATED")
+                    else:
+                        # Unauthenticated response: 32B pubkey only
+                        server_pub_bytes = response_bytes
+                        if server_identity_pubkey:
+                            logger.warning(f"[{identifier}] Server did not sign response — UNAUTHENTICATED")
+                        else:
+                            logger.info(f"[{identifier}] Key exchange completed — UNAUTHENTICATED")
+
                     logger.info(f"Received server ephemeral pubkey for session {identifier}")
                     return derive_shared_keys(client_priv, server_pub_bytes)
 
@@ -206,8 +267,13 @@ def perform_key_exchange(identifier, args):
 
 def main(args):
     identifier = uuid4().hex[:8]
+
+    # Load optional authentication keys
+    signing_key = load_signing_key(args.signing_key) if args.signing_key else None
+    server_identity_pubkey = load_identity_pubkey(args.server_identity_pubkey) if args.server_identity_pubkey else None
+
     # Key exchange
-    aes_key, hmac_key = perform_key_exchange(identifier, args)
+    aes_key, hmac_key = perform_key_exchange(identifier, args, signing_key, server_identity_pubkey)
     logger.info(f"Keys established for session {identifier}")
 
     # Encrypt, HMAC, Base32
@@ -238,6 +304,10 @@ def parse_args():
                    help='Reducing the minimum delay below 500ms may trigger IDS/IPS, rate limiting, or other actions to protect dns servers.')
     p.add_argument('--high', type=int, default=1000,
                    help='Should be adjusted to maintain a QPS of 1-2 queries per second.')
+    p.add_argument('--signing-key', default=None,
+                   help='Path to client Ed25519 private key for authentication')
+    p.add_argument('--server-identity-pubkey', default=None,
+                   help='Path to server Ed25519 public key for verifying server identity')
 
     return p.parse_args()
 
