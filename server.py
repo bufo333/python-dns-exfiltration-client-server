@@ -47,8 +47,8 @@ session_server_pubkeys = {}
 # === Rate Limiting ===
 _rate_lock = threading.Lock()
 _ip_timestamps = defaultdict(list)
-RATE_LIMIT_WINDOW = 60   # seconds
-RATE_LIMIT_MAX = 200     # max requests per IP per window
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 200
 
 
 def is_rate_limited(ip: str) -> bool:
@@ -305,5 +305,14 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=5300)
     parser.add_argument('--output-dir', default='output')
     parser.add_argument('--domain', default='xf.example.com')
+    parser.add_argument('--rate-limit-window', type=int, default=60,
+                        help='Rate limit window in seconds (default: 60)')
+    parser.add_argument('--rate-limit-max', type=int, default=200,
+                        help='Max requests per IP per window (default: 200)')
     args = parser.parse_args()
+
+    global RATE_LIMIT_WINDOW, RATE_LIMIT_MAX
+    RATE_LIMIT_WINDOW = args.rate_limit_window
+    RATE_LIMIT_MAX = args.rate_limit_max
+
     start_server(args)
