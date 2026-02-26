@@ -126,16 +126,6 @@ def chunk_payload(b32_string, identifier, *, min_size=16, max_label_len=52):
         yield f"{identifier}-{idx}-{total}-{seg}"
 
 
-# def chunk_payload(b32_string, identifier, domain):
-#     """
-#     Split Base32 string into DNS-safe subdomains.
-#     """
-#     max_label = 63 - (len(identifier) + len(domain) + 2)
-#     segments = [b32_string[i:i + max_label] for i in range(0, len(b32_string), max_label)]
-#     total = len(segments)
-#     for idx, seg in enumerate(segments):
-#         yield f"{identifier}-{idx}-{total}-{seg}"
-
 
 def send_query(subdomain, args):
     """
@@ -189,15 +179,21 @@ def perform_key_exchange(identifier, args):
     return derive_shared_keys(client_priv, server_pub)
 
 
-def fetch_server_pubkey(domain):
+def fetch_server_pubkey(domain, server_ip, server_port):
+    """
+    Fetch the server's X25519 public key via DNS TXT query to public.<domain>.
+    Returns raw 32-byte public key.
+    """
     q = DNSRecord.question(f"public.{domain}", 'TXT')
-    a = q.send(dest=args.server_ip, port=args.server_port, timeout=2)
-    txt = str(DNSRecord.parse(a).get_a().rdata).strip('"')
-    pad_len = (8 - len(txt) % 8) % 8
-    txt = str(txt) + "=" * pad_len  # add padding
-    print(txt)
-    # Or just take the first TXT string:
-    return base64.b32decode(txt)  # add padding if needed
+    a = q.send(dest=server_ip, port=server_port, timeout=2)
+    resp = DNSRecord.parse(a)
+    for rr in resp.rr:
+        if rr.rtype == QTYPE.TXT:
+            txt = str(rr.rdata).strip('"')
+            pad_len = (8 - len(txt) % 8) % 8
+            txt = txt + "=" * pad_len
+            return base64.b32decode(txt)
+    raise ValueError("No TXT record found in response from server")
 
 
 def main(args):
@@ -240,5 +236,5 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
-    args.server_pubkey = fetch_server_pubkey(args.domain)
+    args.server_pubkey = fetch_server_pubkey(args.domain, args.server_ip, args.server_port)
     main(args)
