@@ -42,16 +42,6 @@ logger = logging.getLogger('client')
 
 # Constants
 MAX_RETRIES = 3
-DNS_IP = '192.0.2.1'
-
-
-def load_server_public_key(path):
-    """
-    Load X25519 server public key from raw file.
-    """
-    with open(path, 'rb') as f:
-        data = f.read()
-    return x25519.X25519PublicKey.from_public_bytes(data)
 
 
 def derive_shared_keys(client_priv, server_pub):
@@ -166,7 +156,6 @@ def perform_key_exchange(identifier, args):
     Returns (aes_key, hmac_key).
     """
     server_pub = x25519.X25519PublicKey.from_public_bytes(args.server_pubkey)
-    # load_server_public_key(args.server_pubkey)
     client_priv = x25519.X25519PrivateKey.generate()
     pub_bytes = client_priv.public_key().public_bytes(encoding=serialization.Encoding.Raw,
                                                       format=serialization.PublicFormat.Raw)

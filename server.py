@@ -132,22 +132,6 @@ def verify_hmac(payload, tag, hmac_key):
 
 
 # === DNS Handlers ===
-def parse_qname(data):
-    """
-    Extract QNAME from DNS query packet bytes.
-    """
-    offset = 12
-    labels = []
-    while True:
-        length = data[offset]
-        if length == 0:
-            break
-        offset += 1
-        labels.append(data[offset:offset + length].decode('ascii'))
-        offset += length
-    return '.'.join(labels)
-
-
 def send_dns_response(data, addr, sock):
     """
     Send a minimal DNS A response (192.0.2.1) for given request.
