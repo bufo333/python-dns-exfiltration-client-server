@@ -11,15 +11,17 @@ Description:
 
 Author: John Burns
 Date: 2025-05-02
+Version: 4.0
 """
 
 import argparse
-import hashlib
 import os
 import stat
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
+
+from crypto_utils import compute_fingerprint
 
 
 def main():
@@ -55,7 +57,7 @@ def main():
     with open(pub_path, 'wb') as f:
         f.write(pub_bytes)
 
-    fingerprint = hashlib.sha256(pub_bytes).hexdigest()[:16]
+    fingerprint = compute_fingerprint(priv_key.public_key()).hex()
     print(f"Keypair generated:")
     print(f"  Private key: {priv_path}")
     print(f"  Public key:  {pub_path}")
