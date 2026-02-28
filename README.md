@@ -23,7 +23,9 @@ v4.0 is a breaking change from v3.x — both client and server must be updated t
 
 ### New Features
 - **`crypto_utils.py`** — shared crypto module eliminates code duplication across client/server/keygen
-- **`SessionManager` class** — replaces module-level global dicts with encapsulated, thread-safe session state
+- **`SessionManager` class** — replaces module-level global dicts with encapsulated, thread-safe session state; tracks per-session client fingerprints
+- **`TrustedClientStore`** — hot-reloads trusted client public keys from disk every 30 seconds, allowing key updates without server restart
+- **Metadata sidecar files** — on reassembly, writes `<id>.bin.meta` JSON alongside each output file (auth status, client fingerprint, UTC timestamp)
 - **`--require-auth`** — server can reject unauthenticated clients (responds with 0-field rejection payload)
 - **`--session-ttl`** / **`--cleanup-interval`** — configurable session lifetime
 - **`--rate-limit-max-session`** — per-session rate limiting in addition to per-IP
@@ -67,13 +69,14 @@ Shared cryptographic utilities:
 
 ### server.py
 
-- `SessionManager` class manages all session state with two locks (session state + rate limiting)
+- `SessionManager` class manages all session state with two locks (session state + rate limiting); tracks client fingerprints per session
+- `TrustedClientStore` hot-reloads client public keys from disk every 30 seconds in a background thread
 - On TXT queries: parses structured wire format, handles 1-field (unauth) or 3-field (auth) payloads
 - `--require-auth`: rejects unauthenticated clients with 0-field response
 - Duplicate fragment rejection (replay protection)
 - Per-IP and per-session rate limiting
 - Configurable session TTL and cleanup interval
-- On complete reassembly: Base32-decodes, decrypts AES-GCM, writes output
+- On complete reassembly: Base32-decodes, decrypts AES-GCM, writes output file and `.meta` JSON sidecar (auth status, client fingerprint, timestamp)
 
 ---
 

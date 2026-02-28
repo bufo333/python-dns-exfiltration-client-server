@@ -18,7 +18,9 @@ Version: 4.0 (SessionManager, structured wire format, no HMAC layer)
 """
 
 import argparse
+import json
 import logging
+from datetime import datetime, timezone
 import os
 import socket
 import threading
@@ -61,6 +63,7 @@ class SessionManager:
         self._aes_keys = {}
         self._server_pub_cache = {}
         self._auth_status = {}
+        self._client_fingerprints = {}
 
         # Rate limiting state (protected by _rate_lock)
         self._rate_lock = threading.Lock()
@@ -92,13 +95,14 @@ class SessionManager:
         with self._lock:
             return session_id in self._aes_keys
 
-    def store_session(self, session_id, aes_key, response_bytes, auth_status):
+    def store_session(self, session_id, aes_key, response_bytes, auth_status, client_fingerprint=None):
         with self._lock:
             if session_id in self._aes_keys:
                 return  # Already stored by another thread
             self._aes_keys[session_id] = aes_key
             self._server_pub_cache[session_id] = response_bytes
             self._auth_status[session_id] = auth_status
+            self._client_fingerprints[session_id] = client_fingerprint
             self._last_seen[session_id] = time.time()
 
     def get_cached_response(self, session_id):
@@ -112,6 +116,10 @@ class SessionManager:
     def get_auth_status(self, session_id):
         with self._lock:
             return self._auth_status.get(session_id, "UNAUTHENTICATED")
+
+    def get_client_fingerprint(self, session_id):
+        with self._lock:
+            return self._client_fingerprints.get(session_id)
 
     def store_fragment(self, session_id, index, total, payload):
         """
@@ -190,6 +198,45 @@ def load_trusted_clients(directory):
     return trusted
 
 
+class TrustedClientStore:
+    """Periodically reloads trusted client keys from a directory."""
+
+    def __init__(self, directory, reload_interval=30):
+        self._directory = directory
+        self._reload_interval = reload_interval
+        self._lock = threading.Lock()
+        self._clients = load_trusted_clients(directory)
+        self._reload_thread = threading.Thread(target=self._reload_loop, daemon=True)
+        self._reload_thread.start()
+
+    def _reload_loop(self):
+        while True:
+            time.sleep(self._reload_interval)
+            try:
+                new_clients = load_trusted_clients(self._directory)
+                with self._lock:
+                    self._clients = new_clients
+                logger.debug(f"Reloaded {len(new_clients)} trusted client key(s)")
+            except Exception as e:
+                logger.warning(f"Failed to reload trusted clients: {e}")
+
+    def get(self, fingerprint):
+        with self._lock:
+            return self._clients.get(fingerprint)
+
+    def __contains__(self, fingerprint):
+        with self._lock:
+            return fingerprint in self._clients
+
+    def __bool__(self):
+        with self._lock:
+            return bool(self._clients)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._clients)
+
+
 # === DNS Helpers ===
 
 def send_dns_response(data, addr, sock):
@@ -234,8 +281,8 @@ def handle_key_exchange(identifier, payload, manager, signing_key, trusted_clien
         client_fp = fields[2]
 
         if trusted_clients:
-            if client_fp in trusted_clients:
-                client_identity_key = trusted_clients[client_fp]
+            client_identity_key = trusted_clients.get(client_fp)
+            if client_identity_key is not None:
                 try:
                     client_identity_key.verify(client_sig, client_pub_bytes)
                     client_authenticated = True
@@ -279,7 +326,8 @@ def handle_key_exchange(identifier, payload, manager, signing_key, trusted_clien
     )
 
     auth_status = "TRUSTED" if client_authenticated else "UNAUTHENTICATED"
-    manager.store_session(identifier, aes_key, response_payload, auth_status)
+    fingerprint = client_fp.hex() if client_authenticated and len(fields) == 3 else None
+    manager.store_session(identifier, aes_key, response_payload, auth_status, fingerprint)
 
     logger.info(f"[{identifier}] Ephemeral session keys established (auth={auth_status})")
     return response_payload
@@ -314,12 +362,23 @@ def handle_data_chunk(identifier, index, total, payload, manager, args):
             return
 
         auth_status = manager.get_auth_status(identifier)
+        client_fingerprint = manager.get_client_fingerprint(identifier)
 
         out_dir = args.output_dir
         os.makedirs(out_dir, exist_ok=True)
         file_path = os.path.join(out_dir, f"{identifier}.bin")
         with open(file_path, 'wb') as f:
             f.write(plaintext)
+
+        meta_path = os.path.join(out_dir, f"{identifier}.bin.meta")
+        meta = {
+            "auth_status": auth_status,
+            "client_fingerprint": client_fingerprint,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f)
+
         logger.info(
             f"EXFIL session_id={identifier} chunks={total} "
             f"plaintext_bytes={len(plaintext)} auth={auth_status} output={file_path}"
@@ -455,7 +514,7 @@ if __name__ == '__main__':
         signing_key = load_signing_key(args.signing_key)
         logger.info(f"Loaded server signing key from {args.signing_key}")
     if args.trusted_clients_dir:
-        trusted_clients = load_trusted_clients(args.trusted_clients_dir)
-        logger.info(f"Loaded {len(trusted_clients)} trusted client key(s)")
+        trusted_clients = TrustedClientStore(args.trusted_clients_dir)
+        logger.info(f"Loaded {len(trusted_clients)} trusted client key(s) (auto-reload enabled)")
 
     start_server(args, signing_key, trusted_clients)
